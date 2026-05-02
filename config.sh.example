@@ -1,0 +1,41 @@
+# Personal config for pdal-xcframework-builder.
+# Copy to config.sh and edit. config.sh is gitignored.
+
+# Path to the gdal.xcframework PDAL should link against.
+# This is the xcframework produced by gdal-xcframework-builder.
+GDAL_XCFRAMEWORK="/Users/mnmly/Development-local/Personal/SwiftPDAL/Frameworks/gdal.xcframework"
+
+# Homebrew prefix for proj@9 (or compatible). proj.db is copied from here.
+PROJ_PREFIX="$(brew --prefix proj@9 2>/dev/null || echo /opt/homebrew/opt/proj@9)"
+
+# Optional: codesign identity. Leave empty to skip codesign.
+CODESIGN_IDENTITY=""
+# Example:
+# CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+
+# Where the final pdalcpp.xcframework + zip should be written.
+OUTPUT_DIR="${OUTPUT_DIR:-$(pwd)/output}"
+
+# Optional: mirror the xcframework into a Swift package's Frameworks dir.
+SWIFT_PACKAGE_FRAMEWORKS_DIR=""
+# Example:
+# SWIFT_PACKAGE_FRAMEWORKS_DIR="/Users/you/Development-local/Personal/SwiftPDAL/Frameworks"
+
+# Optional: GitHub repo (owner/name) for `make release`. Leave empty to skip.
+GH_RELEASE_REPO=""
+
+# Architectures (currently only arm64 is tested).
+ARCHS="arm64"
+
+# macOS deployment target.
+DEPLOYMENT_TARGET="26.0"
+
+# PDAL plugins to enable (space-separated, no BUILD_PLUGIN_ prefix).
+ENABLED_PLUGINS="E57"
+
+# Override the git tag if PDAL's tagging convention changes.
+# Leave empty to auto-detect (<version> then v<version>).
+PDAL_TAG=""
+
+# Extra cmake flags appended to the configure step.
+EXTRA_CMAKE_FLAGS=""

@@ -1,0 +1,131 @@
+framework module pdalcpp {
+    umbrella header "pdal.hpp"
+
+    export *
+    module * { export * }
+
+    explicit module Artifact {
+        header "Artifact.hpp"
+        export *
+    }
+
+    explicit module ArtifactManager {
+        header "ArtifactManager.hpp"
+        export *
+    }
+
+    explicit module Dimension {
+        header "Dimension.hpp"
+        export *
+    }
+
+    explicit module Filter {
+        header "Filter.hpp"
+        export *
+    }
+
+    explicit module Geometry {
+        header "Geometry.hpp"
+        export *
+    }
+
+    explicit module KDIndex {
+        header "KDIndex.hpp"
+        export *
+    }
+
+    explicit module Log {
+        header "Log.hpp"
+        export *
+    }
+
+    explicit module Mesh {
+        header "Mesh.hpp"
+        export *
+    }
+
+    explicit module Metadata {
+        header "Metadata.hpp"
+        export *
+    }
+
+    explicit module Options {
+        header "Options.hpp"
+        export *
+    }
+
+    explicit module PipelineManager {
+        header "PipelineManager.hpp"
+        export *
+    }
+
+    explicit module PipelineExecutor {
+        header "PipelineExecutor.hpp"
+        export *
+    }
+
+    explicit module PointLayout {
+        header "PointLayout.hpp"
+        export *
+    }
+
+    explicit module PointRef {
+        header "PointRef.hpp"
+        export *
+    }
+
+    explicit module PointTable {
+        header "PointTable.hpp"
+        export *
+    }
+
+    explicit module PointView {
+        header "PointView.hpp"
+        export *
+    }
+
+    explicit module Polygon {
+        header "Polygon.hpp"
+        export *
+    }
+
+    explicit module QuadIndex {
+        header "QuadIndex.hpp"
+        export *
+    }
+
+    explicit module Reader {
+        header "Reader.hpp"
+        export *
+    }
+
+    explicit module Scaling {
+        header "Scaling.hpp"
+        export *
+    }
+
+    explicit module SpatialReference {
+        header "SpatialReference.hpp"
+        export *
+    }
+
+    explicit module Stage {
+        header "Stage.hpp"
+        export *
+    }
+
+    explicit module StageFactory {
+        header "StageFactory.hpp"
+        export *
+    }
+
+    explicit module StageWrapper {
+        header "StageWrapper.hpp"
+        export *
+    }
+
+    explicit module Writer {
+        header "Writer.hpp"
+        export *
+    }
+}
