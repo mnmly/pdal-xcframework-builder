@@ -343,7 +343,6 @@ build_ios_slice() {
     local e57_build="${WORK}/build-${slice_name}"
     local e57_install="${WORK}/install-${slice_name}"
     local stage_ios="${WORK}/stage-${slice_name}"
-    local fw_ios="${stage_ios}/E57Format.framework"
 
     step "iOS/${sdk}: 1) build xerces-c"
     XERCES_VERSION="${XERCES_VERSION}" \
@@ -356,6 +355,11 @@ build_ios_slice() {
     # CMAKE_PREFIX_PATH because the toolchain pins
     # CMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY (intentional — keeps host
     # libs out of cross builds). Bypass with explicit XercesC_* vars.
+    # E57_RELEASE_LTO=OFF: libE57Format enables thin LTO in Release
+    # builds, which makes the static archive members LLVM bitcode
+    # instead of native Mach-O objects. xcodebuild -create-xcframework
+    # then rejects the .a with "Unknown header: 0xb17c0de". We need
+    # native objects for the library xcframework to be valid.
     cmake -S "${E57_SRC}" -B "${e57_build}" \
         -DCMAKE_TOOLCHAIN_FILE="${toolchain}" \
         -DCMAKE_INSTALL_PREFIX="${e57_install}" \
@@ -367,6 +371,7 @@ build_ios_slice() {
         -DBUILD_EXAMPLES=OFF \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DE57_RELEASE_LTO=OFF \
         ${EXTRA_CMAKE_FLAGS}
 
     step "iOS/${sdk}: 3) build + install libE57Format"
@@ -379,107 +384,75 @@ build_ios_slice() {
         return 1
     }
 
-    step "iOS/${sdk}: 4) assemble flat framework (relocatable Mach-O)"
-    mkdir -p "${fw_ios}/Headers" "${fw_ios}/Modules"
+    step "iOS/${sdk}: 4) assemble library xcframework slice"
+    # Library xcframework slice (not framework). See the parallel
+    # comment in build.sh build_ios_slice for the full reasoning —
+    # Xcode's framework-embed pipeline corrupts our static framework
+    # binaries on iOS apps. Library xcframeworks ship as
+    # `<slice>/lib<name>.a + Headers/`, link directly into the
+    # consumer binary, no embedded framework to validate.
+    mkdir -p "${stage_ios}/Headers"
 
-    # xcodebuild -create-xcframework rejects framework binaries that are
-    # ar archives ("Unknown header: 0xb17c0de"). It expects a single
-    # Mach-O object. Use ld -r to relocatably link all members of both
-    # static archives into one MH_OBJECT. This also merges xerces-c
-    # symbols into the E57Format binary, identical to the macOS slice's
-    # dylibbundler approach in spirit.
-    local objdir="${stage_ios}/objs"
-    rm -rf "${objdir}" && mkdir -p "${objdir}"
-    ( cd "${objdir}" && \
-        ar -x "${e57_archive}" && \
-        ar -x "${xerces_prefix}/lib/libxerces-c.a" )
+    # libtool -static merges libE57Format + xerces-c into one ar
+    # archive. Earlier we hit the "Unknown header: 0xb17c0de" rejection
+    # when feeding an ar archive to `xcodebuild -create-xcframework
+    # -framework`, but `-library` accepts ar archives natively.
+    libtool -static -arch_only arm64 \
+        -o "${stage_ios}/libE57Format.a" \
+        "${e57_archive}" \
+        "${xerces_prefix}/lib/libxerces-c.a"
 
-    local sdk_root sdk_platform
-    case "${sdk}" in
-        device)    sdk_root="$(xcrun --sdk iphoneos --show-sdk-path)" ;;
-        simulator) sdk_root="$(xcrun --sdk iphonesimulator --show-sdk-path)" ;;
-    esac
-    case "${sdk}" in
-        device)    sdk_platform="ios" ;;
-        simulator) sdk_platform="ios-simulator" ;;
-    esac
+    # Headers under Headers/E57Format/ — keeps `<E57Format/X.h>`-style
+    # includes resolving. macOS frameworks get this via the
+    # `<FrameworkName>/...` framework convention; library xcframeworks
+    # have flat -I exposure, so the slice's own Headers tree needs the
+    # `E57Format/` subdir prefix.
+    mkdir -p "${stage_ios}/Headers/E57Format"
+    cp -R "${e57_install}/include/E57Format/." "${stage_ios}/Headers/E57Format/"
 
-    ld -r -arch arm64 \
-        -syslibroot "${sdk_root}" \
-        -platform_version "${sdk_platform}" "${IOS_DEPLOYMENT_TARGET:-17.0}" "${IOS_DEPLOYMENT_TARGET:-17.0}" \
-        -o "${fw_ios}/E57Format" \
-        "${objdir}"/*.o
-    rm -rf "${objdir}"
-
-    # Headers — flatten libE57Format's include/E57Format/ into Headers/
-    # to match the macOS slice and keep the umbrella header path
-    # (E57Format.h) directly resolvable from the modulemap.
-    cp -R "${e57_install}/include/E57Format/." "${fw_ios}/Headers/"
-
-    cat > "${fw_ios}/Modules/module.modulemap" <<'EOF'
-framework module E57Format {
-    umbrella header "E57Format.h"
-    requires cplusplus
-    export *
-    module * { export * }
-}
-EOF
-
-    cat > "${fw_ios}/Info.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleDevelopmentRegion</key>      <string>English</string>
-    <key>CFBundleExecutable</key>             <string>E57Format</string>
-    <key>CFBundleIdentifier</key>             <string>com.github.asmaloney.libE57Format</string>
-    <key>CFBundleInfoDictionaryVersion</key>  <string>6.0</string>
-    <key>CFBundleName</key>                   <string>E57Format</string>
-    <key>CFBundlePackageType</key>            <string>FMWK</string>
-    <key>CFBundleShortVersionString</key>     <string>${LIBE57_VERSION}</string>
-    <key>CFBundleVersion</key>                <string>${LIBE57_VERSION}</string>
-    <key>CFBundleSupportedPlatforms</key>     <array><string>${platform_name}</string></array>
-    <key>MinimumOSVersion</key>               <string>${IOS_DEPLOYMENT_TARGET:-17.0}</string>
-</dict>
-</plist>
-EOF
-    plutil -lint "${fw_ios}/Info.plist" >/dev/null
-
-    # Licenses, flat layout — sit at framework root for static iOS frameworks.
-    local lic_e57 lic_xerces
-    lic_e57="$(find "${E57_SRC}" -maxdepth 1 -type f -iname 'license*' | head -1)"
-    [ -n "${lic_e57}" ] && cp "${lic_e57}" "${fw_ios}/LICENSE.txt" || true
-    lic_xerces="$(find "${XERCES_SRC}" -maxdepth 1 -type f -iname 'license*' | head -1)"
-    [ -n "${lic_xerces}" ] && cp "${lic_xerces}" "${fw_ios}/LICENSE-xerces.txt" || true
-
-    IOS_FRAMEWORKS+=("${fw_ios}")
-    echo "iOS/${sdk} framework: ${fw_ios}"
+    IOS_LIBRARY_ARGS+=( -library "${stage_ios}/libE57Format.a" -headers "${stage_ios}/Headers" )
+    echo "iOS/${sdk} library slice: ${stage_ios}/libE57Format.a"
 }
 
 build_macos_slice
 
-IOS_FRAMEWORKS=()
+IOS_LIBRARY_ARGS=()
 if [ "${BUILD_IOS:-0}" = "1" ]; then
     build_ios_slice device
     build_ios_slice simulator
 fi
 
 ############################################
-step "9/9  Wrap in xcframework + zip"
+step "9/9  Wrap in xcframework(s) + zip"
 ############################################
+# xcodebuild rejects mixing framework + library slices in one
+# xcframework. Ship two separate artifacts when BUILD_IOS=1:
+#   - E57Format.xcframework        macOS-only, dynamic framework.
+#   - E57Format-ios.xcframework    iOS device + simulator, static libs.
+
 XC_OUT="${OUTPUT_DIR}/E57Format.xcframework"
 rm -rf "${XC_OUT}"
-xcframework_args=( -framework "${FW}" )
-for fw in "${IOS_FRAMEWORKS[@]:-}"; do
-    [ -n "${fw}" ] && xcframework_args+=( -framework "${fw}" )
-done
-xcodebuild -create-xcframework "${xcframework_args[@]}" -output "${XC_OUT}"
+xcodebuild -create-xcframework -framework "${FW}" -output "${XC_OUT}"
+
+XC_OUT_IOS=""
+if [ "${#IOS_LIBRARY_ARGS[@]}" -gt 0 ]; then
+    XC_OUT_IOS="${OUTPUT_DIR}/E57Format-ios.xcframework"
+    rm -rf "${XC_OUT_IOS}"
+    xcodebuild -create-xcframework \
+        "${IOS_LIBRARY_ARGS[@]}" \
+        -output "${XC_OUT_IOS}"
+fi
 
 if [ -n "${SWIFT_PACKAGE_FRAMEWORKS_DIR:-}" ]; then
     mkdir -p "${SWIFT_PACKAGE_FRAMEWORKS_DIR}"
     rm -rf "${SWIFT_PACKAGE_FRAMEWORKS_DIR}/E57Format.xcframework"
     cp -R "${XC_OUT}" "${SWIFT_PACKAGE_FRAMEWORKS_DIR}/"
     echo "copied to ${SWIFT_PACKAGE_FRAMEWORKS_DIR}/E57Format.xcframework"
+    if [ -n "${XC_OUT_IOS}" ]; then
+        rm -rf "${SWIFT_PACKAGE_FRAMEWORKS_DIR}/E57Format-ios.xcframework"
+        cp -R "${XC_OUT_IOS}" "${SWIFT_PACKAGE_FRAMEWORKS_DIR}/"
+        echo "copied to ${SWIFT_PACKAGE_FRAMEWORKS_DIR}/E57Format-ios.xcframework"
+    fi
 fi
 
 cd "${OUTPUT_DIR}"
@@ -492,9 +465,24 @@ if command -v swift >/dev/null 2>&1; then
     CHECKSUM="$(swift package compute-checksum "${ZIP}")"
 fi
 
+ZIP_IOS=""
+CHECKSUM_IOS=""
+if [ -n "${XC_OUT_IOS}" ]; then
+    ZIP_IOS="E57Format-ios.xcframework.zip"
+    rm -f "${ZIP_IOS}"
+    ditto -c -k --sequesterRsrc --keepParent E57Format-ios.xcframework "${ZIP_IOS}"
+    command -v swift >/dev/null 2>&1 && \
+        CHECKSUM_IOS="$(swift package compute-checksum "${ZIP_IOS}")"
+fi
+
 printf "\n\033[1;32mDONE\033[0m  %s\n" "${XC_OUT}"
 printf "      zip: %s\n" "${OUTPUT_DIR}/${ZIP}"
 [ -n "${CHECKSUM}" ] && printf "      swift checksum: %s\n" "${CHECKSUM}"
+if [ -n "${XC_OUT_IOS}" ]; then
+    printf "\n\033[1;32mDONE\033[0m  %s\n" "${XC_OUT_IOS}"
+    printf "      zip: %s\n" "${OUTPUT_DIR}/${ZIP_IOS}"
+    [ -n "${CHECKSUM_IOS}" ] && printf "      swift checksum: %s\n" "${CHECKSUM_IOS}"
+fi
 
 if [ "${RELEASE:-0}" = "1" ]; then
     if [ -z "${GH_RELEASE_REPO:-}" ]; then

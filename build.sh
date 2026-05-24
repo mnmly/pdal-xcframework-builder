@@ -343,17 +343,18 @@ build_ios_slice() {
 
     local gdal_dir="${GDAL_XCFRAMEWORK}/${slice_name}/gdal.framework/lib/cmake/gdal"
     local proj_dir="${PROJ_XCFRAMEWORK}/${slice_name}/proj.framework/lib/cmake/proj"
-    local e57_fw="${E57FORMAT_XCFRAMEWORK_RESOLVED}/${slice_name}/E57Format.framework"
+    # E57Format-ios.xcframework is a library xcframework — headers live
+    # directly under <slice>/Headers.
+    local e57_headers="${E57FORMAT_XCFRAMEWORK_RESOLVED}/${slice_name}/Headers"
     local proj_fw="${PROJ_XCFRAMEWORK}/${slice_name}/proj.framework"
     [ -d "${gdal_dir}" ] || { echo "missing GDAL cmake config: ${gdal_dir}" >&2; return 1; }
     [ -d "${proj_dir}" ] || { echo "missing PROJ cmake config: ${proj_dir}" >&2; return 1; }
-    [ -d "${e57_fw}/Headers" ] || { echo "missing E57Format headers: ${e57_fw}/Headers" >&2; return 1; }
+    [ -d "${e57_headers}" ] || { echo "missing E57Format headers: ${e57_headers}" >&2; return 1; }
     [ -f "${proj_fw}/proj" ] || { echo "missing PROJ binary: ${proj_fw}/proj" >&2; return 1; }
 
     local build_dir_ios="${WORK}/build-${slice_name}"
     local install_dir_ios="${WORK}/install-${slice_name}"
     local stage_ios="${WORK}/stage-${slice_name}"
-    local fw_ios="${stage_ios}/pdalcpp.framework"
 
     step "iOS/${sdk}: 1) Configure PDAL static"
     rm -rf "${build_dir_ios}" "${install_dir_ios}" "${stage_ios}"
@@ -467,7 +468,7 @@ PY
     local plugin_src="${SRC_DIR}/plugins/e57/io"
     local plugin_includes=(
         -I"${install_dir_ios}/include"
-        -I"${e57_fw}/Headers"
+        -I"${e57_headers}"
         -I"${SRC_DIR}/vendor"
         -I"${SRC_DIR}/vendor/nlohmann"
         -I"${plugin_src}"
@@ -490,8 +491,17 @@ PY
             -o "${plugin_objdir}/${src%.cpp}.o"
     done
 
-    step "iOS/${sdk}: 4) Assemble flat framework (relocatable Mach-O)"
-    mkdir -p "${fw_ios}/Headers" "${fw_ios}/Modules" "${fw_ios}/Resources"
+    step "iOS/${sdk}: 4) Assemble library xcframework slice"
+    # Library xcframework slice (not framework). Xcode's framework-embed
+    # pipeline corrupts static iOS framework binaries: an MH_OBJECT
+    # framework binary gets silently stripped down to a ~50KB stub at
+    # embed time, producing `MIInstallerErrorDomain Code 35
+    # PackageInspectionFailed` from `installd`. Static iOS xcframeworks
+    # ship as `<slice>/lib<name>.a + Headers/` (no .framework wrapper)
+    # — `copclib.xcframework` already follows this pattern. Xcode then
+    # links the static archive's symbols directly into the consumer
+    # app's main binary; no embedded framework to validate.
+    mkdir -p "${stage_ios}/Headers"
 
     # ld -r directly on each archive — extracts members internally by
     # archive index, no filename collisions. (ar -x DROPS members on
@@ -512,71 +522,56 @@ PY
         "${build_dir_ios}/vendor/schema-validator/libpdal_json_schema.a"
         "${curl_prefix}/lib/libcurl.a"
     )
-    local ld_inputs=( -force_load "${libpdal}" )
     for v in "${vendor_libs[@]}"; do
         [ -f "${v}" ] || { echo "missing vendor archive: ${v}" >&2; return 1; }
-        ld_inputs+=( -force_load "${v}" )
     done
 
-    ld -r -arch arm64 \
-        -syslibroot "${sdk_root}" \
-        -platform_version "ios${triple_suffix}" \
-            "${IOS_DEPLOYMENT_TARGET:-17.0}" "${IOS_DEPLOYMENT_TARGET:-17.0}" \
-        -o "${fw_ios}/pdalcpp" \
-        "${ld_inputs[@]}" \
-        "${plugin_objdir}"/*.o
+    # Wrap plugin .o files into an archive first; libtool -static
+    # accepts .a inputs, not raw .o files.
+    local plugin_archive="${stage_ios}/libpdal_plugin_reader_e57.a"
+    ar rcs "${plugin_archive}" "${plugin_objdir}"/*.o
     rm -rf "${plugin_objdir}"
 
-    # Headers — nested pdal/ layout, same as macOS.
-    cp -R "${install_dir_ios}/include/pdal" "${fw_ios}/Headers/pdal"
+    # libtool -static merges everything into one ar archive. Duplicate
+    # .o basenames inside (PDAL has Expression.cpp.o in two dirs) are
+    # fine — ar archives index by position, not name, and ld resolves
+    # via symbols.
+    local lib_ios="${stage_ios}/libpdalcpp.a"
+    libtool -static -arch_only arm64 \
+        -o "${lib_ios}" \
+        "${libpdal}" \
+        "${vendor_libs[@]}" \
+        "${plugin_archive}"
+    rm -f "${plugin_archive}"
 
-    # Modulemap — same content as macOS slice.
-    cp "${ROOT}/resources/module.modulemap" "${fw_ios}/Modules/module.modulemap"
+    # Deliberately NOT including `-headers <dir>` in the xcframework.
+    # When SwiftPM consumes a library xcframework with headers, it
+    # auto-adds the slice's Headers dir to the consumer's user-include
+    # path. That conflicts with consumers that already ship a vendored
+    # `pdal/` header tree (e.g. SwiftPDAL's CxxPDAL/include/pdal/),
+    # causing redefinition errors on every PDAL type used by both.
+    # The xcframework contributes only at link time; consumers bring
+    # their own headers.
+    rm -rf "${stage_ios}/Headers"
 
-    # proj.db — still needed at runtime for CRS lookups even on iOS.
-    # PROJ on iOS may use EMBED_PROJ_DATA but PDAL's lookups also use
-    # the on-disk path. Copy from Homebrew (host) — it's the same db
-    # regardless of which platform PROJ was built for.
-    cp "${PROJ_DB_SRC}" "${fw_ios}/Resources/proj.db"
+    # Stash proj.db beside the .a so SwiftPDAL consumers can bundle it
+    # explicitly in their app target if needed.
+    cp "${PROJ_DB_SRC}" "${stage_ios}/proj.db"
 
-    cat > "${fw_ios}/Info.plist" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleDevelopmentRegion</key>      <string>English</string>
-    <key>CFBundleExecutable</key>             <string>pdalcpp</string>
-    <key>CFBundleIdentifier</key>             <string>org.osgeo.pdalcpp</string>
-    <key>CFBundleInfoDictionaryVersion</key>  <string>6.0</string>
-    <key>CFBundleName</key>                   <string>pdalcpp</string>
-    <key>CFBundlePackageType</key>            <string>FMWK</string>
-    <key>CFBundleShortVersionString</key>     <string>${PDAL_VERSION}</string>
-    <key>CFBundleVersion</key>                <string>${PDAL_VERSION}</string>
-    <key>CFBundleSupportedPlatforms</key>     <array><string>${platform_name}</string></array>
-    <key>MinimumOSVersion</key>               <string>${IOS_DEPLOYMENT_TARGET:-17.0}</string>
-</dict>
-</plist>
-EOF
-    plutil -lint "${fw_ios}/Info.plist" >/dev/null
-
-    # License at framework root (no Resources/ subdir convention for flat).
-    local lic
-    lic="$(find "${SRC_DIR}" -maxdepth 1 -type f -iname 'license*' | head -1)"
-    [ -n "${lic}" ] && cp "${lic}" "${fw_ios}/LICENSE.txt" || true
-
-    IOS_FRAMEWORKS+=("${fw_ios}")
-    echo "iOS/${sdk} framework: ${fw_ios}"
+    IOS_LIBRARY_ARGS+=( -library "${lib_ios}" )
+    echo "iOS/${sdk} library slice: ${lib_ios}"
 }
 
 if [ "${SKIP_MACOS:-0}" != "1" ]; then
     build_macos_slice
 fi
 
-IOS_FRAMEWORKS=()
+IOS_LIBRARY_ARGS=()
 if [ "${BUILD_IOS:-0}" = "1" ]; then
     : "${PROJ_XCFRAMEWORK:?PROJ_XCFRAMEWORK must be set when BUILD_IOS=1}"
-    # E57FORMAT_XCFRAMEWORK defaults to the artifact build_e57.sh produces.
-    E57FORMAT_XCFRAMEWORK_RESOLVED="${E57FORMAT_XCFRAMEWORK:-${OUTPUT_DIR}/E57Format.xcframework}"
+    # E57FORMAT_XCFRAMEWORK defaults to the iOS library artifact
+    # produced by build_e57.sh (E57Format-ios.xcframework).
+    E57FORMAT_XCFRAMEWORK_RESOLVED="${E57FORMAT_XCFRAMEWORK:-${OUTPUT_DIR}/E57Format-ios.xcframework}"
     [ -d "${E57FORMAT_XCFRAMEWORK_RESOLVED}" ] || {
         echo "E57FORMAT_XCFRAMEWORK not found at ${E57FORMAT_XCFRAMEWORK_RESOLVED}" >&2
         echo "Run ./build_e57.sh <ver> with BUILD_IOS=1 first." >&2
@@ -587,21 +582,37 @@ if [ "${BUILD_IOS:-0}" = "1" ]; then
 fi
 
 ############################################
-step "8/8  Wrap in xcframework + zip"
+step "8/8  Wrap in xcframework(s) + zip"
 ############################################
+# xcodebuild rejects mixed framework + library xcframeworks. We ship
+# two artifacts when BUILD_IOS=1:
+#   - pdalcpp.xcframework         macOS-only, dynamic framework, unchanged.
+#   - pdalcpp-ios.xcframework     iOS device + simulator, static libraries.
+# SwiftPDAL declares both binaryTargets with platform-conditional deps.
+
 XC_OUT="${OUTPUT_DIR}/pdalcpp.xcframework"
 rm -rf "${XC_OUT}"
-xcframework_args=( -framework "${FW}" )
-for fw in "${IOS_FRAMEWORKS[@]:-}"; do
-    [ -n "${fw}" ] && xcframework_args+=( -framework "${fw}" )
-done
-xcodebuild -create-xcframework "${xcframework_args[@]}" -output "${XC_OUT}"
+xcodebuild -create-xcframework -framework "${FW}" -output "${XC_OUT}"
+
+XC_OUT_IOS=""
+if [ "${#IOS_LIBRARY_ARGS[@]}" -gt 0 ]; then
+    XC_OUT_IOS="${OUTPUT_DIR}/pdalcpp-ios.xcframework"
+    rm -rf "${XC_OUT_IOS}"
+    xcodebuild -create-xcframework \
+        "${IOS_LIBRARY_ARGS[@]}" \
+        -output "${XC_OUT_IOS}"
+fi
 
 if [ -n "${SWIFT_PACKAGE_FRAMEWORKS_DIR:-}" ]; then
     mkdir -p "${SWIFT_PACKAGE_FRAMEWORKS_DIR}"
     rm -rf "${SWIFT_PACKAGE_FRAMEWORKS_DIR}/pdalcpp.xcframework"
     cp -R "${XC_OUT}" "${SWIFT_PACKAGE_FRAMEWORKS_DIR}/"
     echo "copied to ${SWIFT_PACKAGE_FRAMEWORKS_DIR}/pdalcpp.xcframework"
+    if [ -n "${XC_OUT_IOS}" ]; then
+        rm -rf "${SWIFT_PACKAGE_FRAMEWORKS_DIR}/pdalcpp-ios.xcframework"
+        cp -R "${XC_OUT_IOS}" "${SWIFT_PACKAGE_FRAMEWORKS_DIR}/"
+        echo "copied to ${SWIFT_PACKAGE_FRAMEWORKS_DIR}/pdalcpp-ios.xcframework"
+    fi
 fi
 
 cd "${OUTPUT_DIR}"
@@ -614,9 +625,24 @@ if command -v swift >/dev/null 2>&1; then
     CHECKSUM="$(swift package compute-checksum "${ZIP}")"
 fi
 
+ZIP_IOS=""
+CHECKSUM_IOS=""
+if [ -n "${XC_OUT_IOS}" ]; then
+    ZIP_IOS="pdalcpp-ios.xcframework.zip"
+    rm -f "${ZIP_IOS}"
+    ditto -c -k --sequesterRsrc --keepParent pdalcpp-ios.xcframework "${ZIP_IOS}"
+    command -v swift >/dev/null 2>&1 && \
+        CHECKSUM_IOS="$(swift package compute-checksum "${ZIP_IOS}")"
+fi
+
 printf "\n\033[1;32mDONE\033[0m  %s\n" "${XC_OUT}"
 printf "      zip: %s\n" "${OUTPUT_DIR}/${ZIP}"
 [ -n "${CHECKSUM}" ] && printf "      swift checksum: %s\n" "${CHECKSUM}"
+if [ -n "${XC_OUT_IOS}" ]; then
+    printf "\n\033[1;32mDONE\033[0m  %s\n" "${XC_OUT_IOS}"
+    printf "      zip: %s\n" "${OUTPUT_DIR}/${ZIP_IOS}"
+    [ -n "${CHECKSUM_IOS}" ] && printf "      swift checksum: %s\n" "${CHECKSUM_IOS}"
+fi
 
 if [ "${RELEASE:-0}" = "1" ]; then
     if [ -z "${GH_RELEASE_REPO:-}" ]; then
