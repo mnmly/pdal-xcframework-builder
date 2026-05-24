@@ -1,29 +1,38 @@
 # pdal-xcframework-builder
 
-Standalone builder that produces `pdalcpp.xcframework` for macOS (arm64) from any tagged PDAL release. Mirrors `gdal-xcframework-builder` — keeps the recipe outside the PDAL source tree.
+Standalone builder that produces `pdalcpp.xcframework` and `E57Format.xcframework` for macOS arm64 (dynamic) and iOS arm64 device + simulator (static). Mirrors `gdal-xcframework-builder` — keeps the recipe outside the PDAL source tree.
 
 ## Prerequisites
 
-- A built `gdal.xcframework` (e.g. produced by `gdal-xcframework-builder`)
-- Homebrew packages: `cmake dylibbundler proj@9 expat xerces-c`
+- A built `gdal.xcframework` (produced by `gdal-xcframework-builder`)
+- For iOS slices: `proj.xcframework` (also produced by `gdal-xcframework-builder`)
+- Homebrew packages: `cmake dylibbundler proj@9 expat xerces-c curl` (curl for the iOS slice's headers and `find_package(CURL)`)
+- Xcode command line tools (`xcodebuild`, `xcrun`)
 
 ## One-time setup
 
 ```sh
 cp config.sh.example config.sh
-$EDITOR config.sh   # set GDAL_XCFRAMEWORK and (optional) CODESIGN_IDENTITY, OUTPUT_DIR
+$EDITOR config.sh   # set GDAL_XCFRAMEWORK, PROJ_XCFRAMEWORK (for iOS), CODESIGN_IDENTITY (optional)
 ```
 
 ## Build
 
 ```sh
+# macOS-only (current default)
 make PDAL_VERSION=2.10.1
+
+# macOS + iOS device + iOS simulator (3-slice xcframework)
+BUILD_IOS=1 make PDAL_VERSION=2.10.1
+
+# E57Format builder follows the same pattern
+BUILD_IOS=1 make LIBE57_VERSION=3.3.0 e57-xcframework
 ```
 
-Or directly:
+For fast iOS-only iteration during development:
 
 ```sh
-./build.sh 2.10.1
+SKIP_MACOS=1 BUILD_IOS=1 ./build.sh 2.10.1
 ```
 
 Steps (8 phases):
@@ -43,6 +52,47 @@ Steps (8 phases):
 6. Top-level framework symlinks (`pdalcpp`, `Headers`, `Modules`, `Libraries`, `Resources`, `PlugIns` → `Versions/Current/...`) and `Versions/Current → A`
 7. **Codesign inside-out** — every nested `*.dylib` and the `pdalcpp` Mach-O binary are signed individually first, then the bundle is sealed with `--deep`. Defaults to ad-hoc (`-`) when `CODESIGN_IDENTITY` is unset. macOS 26 rejects pages whose nested-library signatures don't match the outer bundle's resource hashes, so the order matters — do not replace this with a single `--deep` pass.
 8. `xcodebuild -create-xcframework` → `OUTPUT_DIR/pdalcpp.xcframework` + `ditto` zip + checksum; (optional) mirror to `SWIFT_PACKAGE_FRAMEWORKS_DIR`
+
+## iOS pipeline
+
+When `BUILD_IOS=1`, the macOS phases above run unchanged, then a sibling `build_ios_slice <device|simulator>` runs for each iOS slice:
+
+1. **Cross-build libcurl + xerces-c statically** for the slice via `scripts/deps/{curl,xerces-c}.sh` into `work/deps-cache/ios-<sdk>/`. SecureTransport TLS for curl (no OpenSSL/MbedTLS), iconv transcoder for xerces (no ICU).
+2. **Configure PDAL** against the iOS toolchain (`scripts/toolchain/ios-{device,sim}.cmake`), pointing at:
+   - `gdal.xcframework`'s iOS slice for GDAL (CMake config mode via `GDAL_DIR`)
+   - `proj.xcframework`'s iOS slice for PROJ
+   - The cross-built libcurl + xerces prefixes
+   - `DIMBUILDER_EXECUTABLE` pointing at the macOS-host build's dimbuilder (PDAL has explicit cross-compile support for this codegen tool)
+3. **Three small CMake patches** applied at configure time and restored on function exit via `trap RETURN`:
+   - `cmake/libraries.cmake`: `PDAL_LIB_TYPE "SHARED"` → `"STATIC"` (PDAL doesn't honor `BUILD_SHARED_LIBS=OFF`)
+   - `CMakeLists.txt`: comment out `install(EXPORT PDALTargets)` (vendor static libs aren't in the export set; we don't ship PDAL's cmake config downstream)
+4. **Build only the `pdalcpp` target** (`cmake --build --target pdalcpp`). The `pdal` CLI and `faux` plugin link via a malformed `CURL::libcurl-NOTFOUND` Make token under STATIC; we don't need either binary.
+5. **Out-of-tree E57 plugin compile.** `BUILD_PLUGIN_E57=OFF` in the PDAL configure (its `PDAL_ADD_PLUGIN` macro hardcodes `add_library(SHARED)`). Instead, compile the 5 plugin sources directly with `clang++ -include scripts/plugin_static_shim.hpp`. The shim redirects `CREATE_SHARED_STAGE` → `CREATE_STATIC_STAGE` so the reader registers via static-init (same path PDAL's in-tree readers use), no upstream patch.
+6. **`ld -r` merge** of `libpdalcpp.a` + every PDAL vendor static archive (lazperf, kazhdan, h3, arbiter, lepcc, json_schema) + cross-built `libcurl.a` + the 5 plugin `.o` files into a single MH_OBJECT Mach-O framework binary. `-force_load` on each archive ensures static-init globals (E57Reader registrar) are preserved.
+   *Why `ld -r` not `libtool -static`*: PDAL has duplicate `.o` basenames (`filters/private/expr/Expression.cpp.o` vs `filters/private/mongoexpression/Expression.cpp.o`). `ar -x` would silently overwrite one with the other.
+7. **Assemble flat framework** at `work/.../stage-ios-<slice>/pdalcpp.framework/` — no `Versions/A` symlink dance on iOS:
+   - `pdalcpp` (the MH_OBJECT binary)
+   - `Headers/pdal/...`, `Modules/module.modulemap`, `Resources/proj.db`, `Info.plist` (with `MinimumOSVersion=17.0`, `CFBundleSupportedPlatforms=[iPhoneOS|iPhoneSimulator]`)
+8. **Single `xcodebuild -create-xcframework`** at the top level aggregates the macOS slice + both iOS slices. Same for `build_e57.sh`.
+
+### Consumer-side notes
+
+The framework's `Headers/pdal/...` nested layout means `<pdal/StageFactory.hpp>`-style includes don't resolve through xcodebuild's default `-F` flag alone. Consumers need an explicit `-I path/to/pdalcpp.framework/Headers` in their C++ target settings. SwiftPDAL's `CxxPDAL` target uses this pattern.
+
+iOS consumers must also link:
+- System libs: `z`, `iconv`, `xml2`, `sqlite3`, `c++`
+- Apple frameworks: `Security`, `CoreFoundation`, `SystemConfiguration` (libcurl's SecureTransport TLS runtime deps)
+
+See `verify/ios-sample/Package.swift` and SwiftPDAL's `Package.swift` for working examples.
+
+### Verify harness
+
+`verify/ios-sample/` is a minimal SwiftPM package that imports the iOS slices and exercises both core (`readers.las`) and plugin (`readers.e57`) registration via `pdal::StageFactory::createStage`. Run with:
+
+```sh
+cd verify/ios-sample
+xcodebuild -scheme IOSSample -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
+```
 
 ## Other targets
 

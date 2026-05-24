@@ -2,9 +2,16 @@
 
 ## Purpose
 
-Standalone tool that builds a `pdalcpp.xcframework` for macOS (arm64) from any tagged upstream PDAL release. Lives **outside** the PDAL source tree. Sibling project to `gdal-xcframework-builder` and depends on its output.
+Standalone tool that builds two xcframeworks from tagged upstream releases:
 
-The xcframework is consumed downstream by `SwiftPDAL` (a Swift Package).
+- `pdalcpp.xcframework` — 3 slices: macOS arm64 (dynamic) + iOS arm64 device (static) + iOS arm64 simulator (static).
+- `E57Format.xcframework` — same 3-slice matrix, libE57Format with xerces-c bundled.
+
+iOS slices are opt-in (`BUILD_IOS=1`). The macOS path is unchanged behaviorally from the pre-iOS implementation.
+
+Lives **outside** the PDAL source tree. Sibling project to `gdal-xcframework-builder` and depends on its output (`gdal.xcframework`, plus `proj.xcframework` for iOS).
+
+Both xcframeworks are consumed downstream by `SwiftPDAL` (a Swift Package).
 
 ## Why this is more involved than the GDAL builder
 
@@ -89,8 +96,49 @@ This builder reproduces the framework structure entirely in shell after a normal
 - **Adding/removing assembly steps in phase 4**: keep the `Versions/A/...` structure intact — Swift consumers and codesign both depend on the standard layout.
 - **A new transitive dep prompts dylibbundler**: `brew install` it, add its lib dir to `DYLIBBUNDLER_SEARCH_PATHS`.
 
+## iOS pipeline (build_ios_slice in build.sh; mirror in build_e57.sh)
+
+Opt-in via `BUILD_IOS=1`. macOS phases run unchanged; iOS phases follow, then phase 8 aggregates all slices into one xcframework.
+
+**Build flow per iOS slice:**
+
+1. `scripts/deps/{curl,xerces-c}.sh` cross-compile their respective deps statically into `work/deps-cache/ios-<sdk>/`. Idempotent — skipped if `lib<dep>.a` already present.
+2. `cmake` configure with `scripts/toolchain/ios-{device,sim}.cmake`, `BUILD_SHARED_LIBS=OFF` semantics enforced via in-place patch to `libraries.cmake` (see "Upstream patches" below).
+3. `cmake --build --target pdalcpp` — restricted to the static library target; `apps/pdal` CLI and `plugins/faux` won't link cleanly under STATIC (CURL::libcurl-NOTFOUND token in their Make rules) and we don't need either binary.
+4. Manual artifact staging — `cmake --install` is skipped because `install(EXPORT PDALTargets)` fails under STATIC (vendor static libs missing from export set). We copy `libpdalcpp.a` + source-tree headers + build-tree generated headers directly.
+5. Out-of-tree compile of the E57 plugin sources (`src/plugins/e57/io/{E57Reader,E57Writer,Scan,Utils,Uuid}.cpp`) with `clang++ -include scripts/plugin_static_shim.hpp`. The shim redefines `CREATE_SHARED_STAGE` → `CREATE_STATIC_STAGE` so the plugin registers via static-init (same path PDAL's in-tree readers use), no upstream patch to the plugin sources.
+6. `ld -r -force_load <archive>` merges into a single MH_OBJECT Mach-O framework binary:
+   - `libpdalcpp.a` (PDAL core)
+   - 6 PDAL vendor archives (lazperf, kazhdan, h3, arbiter, lepcc, json_schema)
+   - Cross-built `libcurl.a` (PDAL's arbiter constructs an HTTP Pool eagerly on startup; `-Wl,-undefined,dynamic_lookup` is NOT a viable shortcut)
+   - The 5 plugin `.o` files
+7. Flat framework assembly (no `Versions/A` on iOS): `pdalcpp` binary + `Headers/pdal/...` + `Modules/module.modulemap` + `Resources/proj.db` + `Info.plist` (`MinimumOSVersion=17.0`, `CFBundleSupportedPlatforms=[iPhoneOS|iPhoneSimulator]`).
+8. Phase 8 then passes all 3 framework paths to `xcodebuild -create-xcframework`.
+
+`build_e57.sh` mirrors this for libE57Format — but only needs xerces-c (no curl, no plugin compile, no apps trickery). Single `ld -r` merges libE57Format + xerces objects.
+
+## Upstream PDAL patches (configure-time, restored on RETURN)
+
+Applied via `sed -i.ios-static.bak` + `trap RETURN`:
+
+1. **`cmake/libraries.cmake`**: `PDAL_LIB_TYPE "SHARED"` → `"STATIC"`. The `set()` lacks `CACHE`, so `-DPDAL_LIB_TYPE=STATIC` is silently clobbered.
+2. **`CMakeLists.txt`** (via python, multi-line surgical replacement): comments out `export(TARGETS …)` + `install(EXPORT PDALTargets …)`. Both fail under STATIC and aren't useful downstream — SwiftPDAL doesn't consume PDAL's CMake config.
+
+These mutations happen inside `build_ios_slice` and revert on function exit so the macOS slice (which re-runs CMake on every build) gets the original "SHARED" back.
+
+## Consumer-side requirements (for SwiftPDAL et al)
+
+The iOS framework's `Headers/pdal/...` nested layout breaks the default `<FrameworkName/...>` xcodebuild include convention. Consumers must add an explicit `-I .../pdalcpp.framework/Headers` for `<pdal/StageFactory.hpp>`-style includes to resolve.
+
+iOS consumers must link these system libs / frameworks (none of these ship inside our framework binary):
+- `-lz -liconv -lxml2 -lsqlite3 -lc++`
+- `-framework Security -framework CoreFoundation -framework SystemConfiguration` (libcurl's SecureTransport TLS runtime deps)
+
+`verify/ios-sample/Package.swift` and SwiftPDAL's `Package.swift` are the canonical consumer examples.
+
 ## Out of scope
 
-- iOS / Catalyst / x86_64 — untested.
-- Patching PDAL source — pure orchestrator over upstream tags. The user's `feature/framework-build` branch on mnmly/PDAL is intentionally **not** consumed; if it lands upstream and gets wired in, this builder can be simplified.
+- Catalyst / visionOS / tvOS / watchOS / x86_64 — untested. iOS arm64 (device + sim) is the new addition; macOS arm64 is the original.
+- Patching PDAL source on disk *outside* the build dir — pure orchestrator over upstream tags. The CMake patches above are local to `work/.../src/` and reverted automatically.
 - Building GDAL itself — sibling project.
+- Publishing libcurl / xerces-c / PROJ as standalone xcframeworks — they're bundled inside ours.
