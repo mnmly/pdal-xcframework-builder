@@ -39,7 +39,9 @@ ASSETS=(
     "${GDAL_BUILDER}/output/gdal.xcframework.zip"
     "${GDAL_BUILDER}/output/proj.xcframework.zip"
     "${ROOT}/output/pdalcpp.xcframework.zip"
+    "${ROOT}/output/pdalcpp-ios.xcframework.zip"
     "${ROOT}/output/E57Format.xcframework.zip"
+    "${ROOT}/output/E57Format-ios.xcframework.zip"
 )
 
 for a in "${ASSETS[@]}"; do
@@ -69,12 +71,28 @@ if [ "${DRY_RUN}" = "1" ]; then
     exit 0
 fi
 
-NOTES="iOS-enabled binary frameworks (macOS arm64 dynamic + iOS arm64 device static + iOS arm64 simulator static).
+NOTES="Apple-platform binary frameworks (macOS dynamic + iOS static).
 
-- gdal.xcframework — GDAL 3.12.4
-- proj.xcframework — PROJ 9.4.0 (iOS-only artifact)
-- pdalcpp.xcframework — PDAL 2.10.1 with E57 reader statically linked, libcurl + xerces-c + all PDAL vendor archives merged
-- E57Format.xcframework — libE57Format 3.3.0 with xerces-c 3.3.0 bundled
+The framework→library xcframework split for iOS:
+xcodebuild rejects mixing framework + library slices in one
+xcframework, so iOS slices ship in separate \`-ios.xcframework\`
+artifacts. SwiftPDAL Package.swift declares both forms with
+platform-conditional dependencies.
+
+- gdal.xcframework — GDAL 3.12.4 (macOS dynamic + iOS device/sim)
+- proj.xcframework — PROJ 9.4.0 (iOS device/sim, library)
+- pdalcpp.xcframework — PDAL 2.10.1 (macOS dynamic framework)
+- pdalcpp-ios.xcframework — PDAL 2.10.1 (iOS device/sim, library);
+  E57 reader statically linked via plugin-static shim, libcurl +
+  xerces-c + all PDAL vendor archives merged
+- E57Format.xcframework — libE57Format 3.3.0 (macOS) with bundled
+  xerces-c 3.3.0
+- E57Format-ios.xcframework — libE57Format 3.3.0 (iOS device/sim)
+
+iOS consumers also need:
+  - OTHER_LDFLAGS[sdk=iphone*] = -Wl,-force_load,\$(BUILT_PRODUCTS_DIR)/libpdalcpp.a
+  - link \`-lz -liconv -lxml2 -lsqlite3 -lc++\`
+  - link Security, CoreFoundation, SystemConfiguration frameworks
 
 Built by gdal-xcframework-builder + pdal-xcframework-builder.
 "
