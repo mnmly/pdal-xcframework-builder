@@ -2,3 +2,6 @@ config.sh
 work/
 output/
 .DS_Store
+verify/baseline/
+verify/ios-sample/.swiftpm/
+verify/ios-sample/.build/

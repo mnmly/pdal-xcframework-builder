@@ -98,6 +98,13 @@ else
     echo "source already present at ${SRC_DIR}"
 fi
 
+# ────────────────────────────────────────────────────────────────────
+# macOS slice (phases 2–7). iOS slices, when added, get a sibling
+# build_ios_slice() function called below. Each slice writes its
+# framework into ${STAGE} and Phase 8 aggregates.
+# ────────────────────────────────────────────────────────────────────
+build_macos_slice() {
+
 ############################################
 step "2/8  Configure"
 ############################################
@@ -209,6 +216,15 @@ cat > "${PLIST}" <<EOF
 EOF
 plutil -lint "${PLIST}" >/dev/null
 
+# Upstream license — PDAL is BSD-style; binary redistribution must carry
+# the notice. Ship it inside the framework's Resources/.
+LICENSE_SRC="$(find "${SRC_DIR}" -maxdepth 1 -type f -iname 'license*' | head -1)"
+if [ -n "${LICENSE_SRC}" ]; then
+    cp "${LICENSE_SRC}" "${FW}/Versions/A/Resources/LICENSE.txt"
+else
+    echo "warning: no LICENSE file found in ${SRC_DIR}" >&2
+fi
+
 ############################################
 step "5/8  Bundle dylib deps + fix rpaths"
 ############################################
@@ -279,12 +295,297 @@ find "${FW}/Versions/A" -type f \( -name "*.dylib" -o -name "pdalcpp" \) \
     -exec codesign --force --sign "${SIGN_ID}" --timestamp=none {} \;
 codesign --force --sign "${SIGN_ID}" --timestamp=none --deep "${FW}"
 
+}  # end build_macos_slice
+
+# ────────────────────────────────────────────────────────────────────
+# iOS slice. PDAL static (BUILD_SHARED_LIBS=OFF) against the iOS
+# slices of gdal.xcframework + proj.xcframework. The E57 reader is
+# NOT built by PDAL's CMake (BUILD_PLUGIN_E57=OFF); instead we
+# compile the 5 plugin .cpp files out-of-tree with a force-included
+# shim header that redirects CREATE_SHARED_STAGE → CREATE_STATIC_STAGE,
+# then relocatably link them into libpdalcpp.a's members via ld -r
+# to produce a single MH_OBJECT framework binary.
+# ────────────────────────────────────────────────────────────────────
+build_ios_slice() {
+    local sdk="$1"  # device | simulator
+
+    local slice_name toolchain_name platform_name sdk_id triple_suffix
+    case "${sdk}" in
+        device)
+            slice_name="ios-arm64"
+            toolchain_name="ios-device.cmake"
+            platform_name="iPhoneOS"
+            sdk_id="iphoneos"
+            triple_suffix=""
+            ;;
+        simulator)
+            slice_name="ios-arm64-simulator"
+            toolchain_name="ios-sim.cmake"
+            platform_name="iPhoneSimulator"
+            sdk_id="iphonesimulator"
+            triple_suffix="-simulator"
+            ;;
+        *) echo "build_ios_slice: unknown sdk '${sdk}'" >&2; return 2 ;;
+    esac
+
+    local toolchain="${ROOT}/scripts/toolchain/${toolchain_name}"
+    local sdk_root
+    sdk_root="$(xcrun --sdk "${sdk_id}" --show-sdk-path)"
+
+    local gdal_dir="${GDAL_XCFRAMEWORK}/${slice_name}/gdal.framework/lib/cmake/gdal"
+    local proj_dir="${PROJ_XCFRAMEWORK}/${slice_name}/proj.framework/lib/cmake/proj"
+    local e57_fw="${E57FORMAT_XCFRAMEWORK_RESOLVED}/${slice_name}/E57Format.framework"
+    local proj_fw="${PROJ_XCFRAMEWORK}/${slice_name}/proj.framework"
+    [ -d "${gdal_dir}" ] || { echo "missing GDAL cmake config: ${gdal_dir}" >&2; return 1; }
+    [ -d "${proj_dir}" ] || { echo "missing PROJ cmake config: ${proj_dir}" >&2; return 1; }
+    [ -d "${e57_fw}/Headers" ] || { echo "missing E57Format headers: ${e57_fw}/Headers" >&2; return 1; }
+    [ -f "${proj_fw}/proj" ] || { echo "missing PROJ binary: ${proj_fw}/proj" >&2; return 1; }
+
+    local build_dir_ios="${WORK}/build-${slice_name}"
+    local install_dir_ios="${WORK}/install-${slice_name}"
+    local stage_ios="${WORK}/stage-${slice_name}"
+    local fw_ios="${stage_ios}/pdalcpp.framework"
+
+    step "iOS/${sdk}: 1) Configure PDAL static"
+    rm -rf "${build_dir_ios}" "${install_dir_ios}" "${stage_ios}"
+    mkdir -p "${build_dir_ios}" "${install_dir_ios}" "${stage_ios}"
+
+    # Upstream patches needed only for iOS static builds. All wrapped in
+    # the same `.ios-static.bak` restoration scheme so macOS reruns are
+    # unaffected.
+    #
+    # 1) libraries.cmake: PDAL_LIB_TYPE is set without CACHE so
+    #    BUILD_SHARED_LIBS=OFF can't override it. Patch to STATIC.
+    # 2) arbiter.cmake: PDAL's arbiter unconditionally pulls in CURL.
+    #    iOS doesn't need network/HTTP arbiter ops; drop the CURL
+    #    integration. arbiter.cpp's curl-using code paths are already
+    #    ifdef-guarded by ARBITER_CURL.
+    # 3) CMakeLists.txt: install(EXPORT PDALTargets) fails when
+    #    PDAL_LIB_TYPE=STATIC because vendor static libs (pdal_h3,
+    #    pdal_arbiter, etc.) aren't in the export set. We don't ship
+    #    PDAL's cmake config downstream (consumers use the framework's
+    #    module map), so drop the export entirely.
+    local libs_cmake="${SRC_DIR}/cmake/libraries.cmake"
+    local top_cmake="${SRC_DIR}/CMakeLists.txt"
+    sed -i.ios-static.bak \
+        's|^set(PDAL_LIB_TYPE "SHARED")|set(PDAL_LIB_TYPE "STATIC")|' \
+        "${libs_cmake}"
+    cp "${top_cmake}" "${top_cmake}.ios-static.bak"
+    python3 - "${top_cmake}" <<'PY'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s = re.sub(r'export\(\s*TARGETS[^)]*PDALTargets\.cmake"\)', '# ios: export(TARGETS) disabled', s)
+s = re.sub(r'install\(\s*EXPORT\s+PDALTargets[^)]*cmake/PDAL"\)', '# ios: install(EXPORT PDALTargets) disabled', s)
+open(p, 'w').write(s)
+PY
+    # shellcheck disable=SC2064
+    trap "
+        mv '${libs_cmake}.ios-static.bak' '${libs_cmake}' 2>/dev/null
+        mv '${top_cmake}.ios-static.bak' '${top_cmake}' 2>/dev/null
+        true
+    " RETURN
+
+    # NB: BUILD_PLUGIN_E57=OFF — we compile the plugin out-of-tree to
+    # keep PDAL's hardcoded `add_library(... SHARED ...)` in macros.cmake
+    # from emitting a useless iOS dylib. See tasks/lessons.md.
+    # dimbuilder is a code-gen executable PDAL builds + runs during its
+    # own build. Cross-compiled iOS binary can't execute on host —
+    # PDAL's dimension.cmake exposes DIMBUILDER_EXECUTABLE for this
+    # exact case. Point it at the macOS-host build's binary.
+    local host_dimbuilder="${BUILD_DIR}/bin/dimbuilder"
+    if [ ! -x "${host_dimbuilder}" ]; then
+        echo "host dimbuilder not found at ${host_dimbuilder}" >&2
+        echo "Run a macOS build first (without SKIP_MACOS=1)." >&2
+        return 1
+    fi
+
+    cmake -S "${SRC_DIR}" -B "${build_dir_ios}" \
+        -DCMAKE_TOOLCHAIN_FILE="${toolchain}" \
+        -DDIMBUILDER_EXECUTABLE="${host_dimbuilder}" \
+        -DCMAKE_INSTALL_PREFIX="${install_dir_ios}" \
+        -DBUILD_SHARED_LIBS=OFF \
+        -DBUILD_PLUGIN_E57=OFF \
+        -DBUILD_TOOLS_LASDUMP=OFF \
+        -DBUILD_TOOLS_NITFWRAP=OFF \
+        -DWITH_TESTS=OFF \
+        -DGDAL_DIR="${gdal_dir}" \
+        -DPROJ_DIR="${proj_dir}" \
+        -DPROJ_LIBRARY="${proj_fw}/proj" \
+        -DPROJ_INCLUDE_DIR="${proj_fw}/Headers" \
+        -DTIFF_LIBRARY="${gdal_dir}/.." \
+        -DTIFF_INCLUDE_DIR="${gdal_dir}/.." \
+        -DCURL_LIBRARY="${sdk_root}/usr/lib/libcurl.tbd" \
+        -DCURL_INCLUDE_DIR="$(brew --prefix curl)/include" \
+        -DGEOTIFF_LIBRARY="${gdal_dir}/.." \
+        -DGEOTIFF_INCLUDE_DIR="${ROOT}/scripts/stubs/include" \
+        -DZLIB_LIBRARY="${sdk_root}/usr/lib/libz.tbd" \
+        -DZLIB_INCLUDE_DIR="${sdk_root}/usr/include" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+        -DCMAKE_MACOSX_BUNDLE=OFF \
+        ${EXTRA_CMAKE_FLAGS}
+
+    step "iOS/${sdk}: 2) Build pdalcpp (static lib only)"
+    # We only need libpdalcpp.a + headers. The `pdal` CLI and faux plugin
+    # targets fail to link because they expect a usable CURL::libcurl as
+    # a real lib dependency; in our static config their IMPORTED_LOCATION
+    # ends up as CURL::libcurl-NOTFOUND (a literal Make token that
+    # breaks parsing). Restricting the build target to pdalcpp avoids
+    # all that — we manually stage the artifacts below.
+    cmake --build "${build_dir_ios}" --target pdalcpp -j "$(sysctl -n hw.ncpu)"
+
+    local libpdal="${build_dir_ios}/libpdalcpp.a"
+    [ -f "${libpdal}" ] || { echo "missing ${libpdal}" >&2; return 1; }
+
+    # Stage headers into a synthetic install tree mirroring what
+    # `cmake --install` would have produced for the pdalcpp target.
+    mkdir -p "${install_dir_ios}/include" "${install_dir_ios}/lib"
+    cp "${libpdal}" "${install_dir_ios}/lib/libpdalcpp.a"
+    # Source-tree headers
+    cp -R "${SRC_DIR}/pdal" "${install_dir_ios}/include/pdal"
+    # Generated headers from the build tree (Dimension.hpp,
+    # pdal_features.hpp, pdal_config.hpp, etc.)
+    if [ -d "${build_dir_ios}/include/pdal" ]; then
+        cp -R "${build_dir_ios}/include/pdal/." "${install_dir_ios}/include/pdal/"
+    fi
+    libpdal="${install_dir_ios}/lib/libpdalcpp.a"
+
+    step "iOS/${sdk}: 3) Out-of-tree compile E57 plugin (static via shim)"
+    local plugin_objdir="${stage_ios}/plugin-objs"
+    mkdir -p "${plugin_objdir}"
+    local triple="arm64-apple-ios${IOS_DEPLOYMENT_TARGET:-17.0}${triple_suffix}"
+    local plugin_src="${SRC_DIR}/plugins/e57/io"
+    local plugin_includes=(
+        -I"${install_dir_ios}/include"
+        -I"${e57_fw}/Headers"
+        -I"${SRC_DIR}/vendor"
+        -I"${SRC_DIR}/vendor/nlohmann"
+        -I"${plugin_src}"
+    )
+    local plugin_files=( E57Reader.cpp E57Writer.cpp Scan.cpp Utils.cpp Uuid.cpp )
+    for src in "${plugin_files[@]}"; do
+        xcrun -sdk "${sdk_id}" clang++ \
+            -target "${triple}" \
+            -isysroot "${sdk_root}" \
+            -arch arm64 \
+            -std=c++17 \
+            -fPIC \
+            -O2 \
+            -fno-objc-arc \
+            -DPDAL_DLL_EXPORT \
+            -DARBITER_ZLIB -DARBITER_DLL_IMPORT \
+            -include "${ROOT}/scripts/plugin_static_shim.hpp" \
+            "${plugin_includes[@]}" \
+            -c "${plugin_src}/${src}" \
+            -o "${plugin_objdir}/${src%.cpp}.o"
+    done
+
+    step "iOS/${sdk}: 4) Assemble flat framework (relocatable Mach-O)"
+    mkdir -p "${fw_ios}/Headers" "${fw_ios}/Modules" "${fw_ios}/Resources"
+
+    # ld -r directly on each archive — extracts members internally by
+    # archive index, no filename collisions. (ar -x DROPS members on
+    # name collision: PDAL has duplicate basenames like Expression.cpp.o
+    # under filters/private/expr/ and filters/private/mongoexpression/,
+    # which would silently mask one definition and break consumer link
+    # with "symbol not found in flat namespace 'pdal::expr::Expression::print'".)
+    #
+    # Use -force_load on each .a so ld pulls in ALL members, including
+    # static-init globals that would otherwise be dropped (E57Reader
+    # registrar, etc.).
+    local vendor_libs=(
+        "${build_dir_ios}/vendor/lazperf/libpdal_lazperf.a"
+        "${build_dir_ios}/vendor/kazhdan/libpdal_kazhdan.a"
+        "${build_dir_ios}/vendor/h3/libpdal_h3.a"
+        "${build_dir_ios}/vendor/arbiter/libpdal_arbiter.a"
+        "${build_dir_ios}/vendor/lepcc/libpdal_lepcc.a"
+        "${build_dir_ios}/vendor/schema-validator/libpdal_json_schema.a"
+    )
+    local ld_inputs=( -force_load "${libpdal}" )
+    for v in "${vendor_libs[@]}"; do
+        [ -f "${v}" ] || { echo "missing vendor archive: ${v}" >&2; return 1; }
+        ld_inputs+=( -force_load "${v}" )
+    done
+
+    ld -r -arch arm64 \
+        -syslibroot "${sdk_root}" \
+        -platform_version "ios${triple_suffix}" \
+            "${IOS_DEPLOYMENT_TARGET:-17.0}" "${IOS_DEPLOYMENT_TARGET:-17.0}" \
+        -o "${fw_ios}/pdalcpp" \
+        "${ld_inputs[@]}" \
+        "${plugin_objdir}"/*.o
+    rm -rf "${plugin_objdir}"
+
+    # Headers — nested pdal/ layout, same as macOS.
+    cp -R "${install_dir_ios}/include/pdal" "${fw_ios}/Headers/pdal"
+
+    # Modulemap — same content as macOS slice.
+    cp "${ROOT}/resources/module.modulemap" "${fw_ios}/Modules/module.modulemap"
+
+    # proj.db — still needed at runtime for CRS lookups even on iOS.
+    # PROJ on iOS may use EMBED_PROJ_DATA but PDAL's lookups also use
+    # the on-disk path. Copy from Homebrew (host) — it's the same db
+    # regardless of which platform PROJ was built for.
+    cp "${PROJ_DB_SRC}" "${fw_ios}/Resources/proj.db"
+
+    cat > "${fw_ios}/Info.plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>      <string>English</string>
+    <key>CFBundleExecutable</key>             <string>pdalcpp</string>
+    <key>CFBundleIdentifier</key>             <string>org.osgeo.pdalcpp</string>
+    <key>CFBundleInfoDictionaryVersion</key>  <string>6.0</string>
+    <key>CFBundleName</key>                   <string>pdalcpp</string>
+    <key>CFBundlePackageType</key>            <string>FMWK</string>
+    <key>CFBundleShortVersionString</key>     <string>${PDAL_VERSION}</string>
+    <key>CFBundleVersion</key>                <string>${PDAL_VERSION}</string>
+    <key>CFBundleSupportedPlatforms</key>     <array><string>${platform_name}</string></array>
+    <key>MinimumOSVersion</key>               <string>${IOS_DEPLOYMENT_TARGET:-17.0}</string>
+</dict>
+</plist>
+EOF
+    plutil -lint "${fw_ios}/Info.plist" >/dev/null
+
+    # License at framework root (no Resources/ subdir convention for flat).
+    local lic
+    lic="$(find "${SRC_DIR}" -maxdepth 1 -type f -iname 'license*' | head -1)"
+    [ -n "${lic}" ] && cp "${lic}" "${fw_ios}/LICENSE.txt" || true
+
+    IOS_FRAMEWORKS+=("${fw_ios}")
+    echo "iOS/${sdk} framework: ${fw_ios}"
+}
+
+if [ "${SKIP_MACOS:-0}" != "1" ]; then
+    build_macos_slice
+fi
+
+IOS_FRAMEWORKS=()
+if [ "${BUILD_IOS:-0}" = "1" ]; then
+    : "${PROJ_XCFRAMEWORK:?PROJ_XCFRAMEWORK must be set when BUILD_IOS=1}"
+    # E57FORMAT_XCFRAMEWORK defaults to the artifact build_e57.sh produces.
+    E57FORMAT_XCFRAMEWORK_RESOLVED="${E57FORMAT_XCFRAMEWORK:-${OUTPUT_DIR}/E57Format.xcframework}"
+    [ -d "${E57FORMAT_XCFRAMEWORK_RESOLVED}" ] || {
+        echo "E57FORMAT_XCFRAMEWORK not found at ${E57FORMAT_XCFRAMEWORK_RESOLVED}" >&2
+        echo "Run ./build_e57.sh <ver> with BUILD_IOS=1 first." >&2
+        exit 1
+    }
+    build_ios_slice device
+    build_ios_slice simulator
+fi
+
 ############################################
 step "8/8  Wrap in xcframework + zip"
 ############################################
 XC_OUT="${OUTPUT_DIR}/pdalcpp.xcframework"
 rm -rf "${XC_OUT}"
-xcodebuild -create-xcframework -framework "${FW}" -output "${XC_OUT}"
+xcframework_args=( -framework "${FW}" )
+for fw in "${IOS_FRAMEWORKS[@]:-}"; do
+    [ -n "${fw}" ] && xcframework_args+=( -framework "${fw}" )
+done
+xcodebuild -create-xcframework "${xcframework_args[@]}" -output "${XC_OUT}"
 
 if [ -n "${SWIFT_PACKAGE_FRAMEWORKS_DIR:-}" ]; then
     mkdir -p "${SWIFT_PACKAGE_FRAMEWORKS_DIR}"

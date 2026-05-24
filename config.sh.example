@@ -39,3 +39,25 @@ PDAL_TAG=""
 
 # Extra cmake flags appended to the configure step.
 EXTRA_CMAKE_FLAGS=""
+
+# ─── iOS slices (opt-in) ───────────────────────────────────────────────
+# Set BUILD_IOS=1 to also build iOS device + simulator static slices
+# alongside the macOS dynamic slice. Both build.sh and build_e57.sh
+# honor this knob. The iOS slices are arm64-only and statically linked.
+BUILD_IOS="${BUILD_IOS:-0}"
+
+# iOS deployment target. Match gdal-xcframework-builder's setting —
+# drift causes Mach-O LC_BUILD_VERSION mismatches.
+IOS_DEPLOYMENT_TARGET="17.0"
+
+# Path to proj.xcframework (iOS-only artifact from gdal-xcframework-builder).
+# REQUIRED when BUILD_IOS=1. macOS keeps using PROJ_PREFIX above.
+PROJ_XCFRAMEWORK=""
+# Example:
+# PROJ_XCFRAMEWORK="/Users/you/Development-local/Personal/SwiftPDAL/Frameworks/proj.xcframework"
+
+# Path to E57Format.xcframework consumed by build.sh's iOS slices.
+# Defaults to ${OUTPUT_DIR}/E57Format.xcframework, i.e. the artifact
+# build_e57.sh produces in the same builder. Run build_e57.sh before
+# build.sh when BUILD_IOS=1.
+E57FORMAT_XCFRAMEWORK=""
