@@ -186,6 +186,22 @@ if [ "${#plugin_files[@]}" -gt 0 ]; then
         # Plugins are dlopen'd from PlugIns/ — give them an rpath up to the
         # framework root so @rpath/pdalcpp.framework/... resolves.
         install_name_tool -add_rpath "@loader_path/../../.." "$plug" 2>/dev/null || true
+        # The E57 plugin links against libE57Format via @rpath/libE57Format.X.dylib.
+        # libE57Format.X.dylib lives as a symlink inside
+        # E57Format.framework/Versions/A/, not at the Frameworks/ root,
+        # so the `@loader_path/../../..` rpath alone doesn't resolve it.
+        # Add a second rpath that points into E57Format.framework's
+        # Versions/A. Plugins that don't reference libE57Format ignore
+        # the extra path harmlessly.
+        #
+        # 4 `../` levels: plugin sits at
+        # pdalcpp.framework/Versions/A/PlugIns/<dylib>, so going up
+        # PlugIns → Versions/A → Versions → pdalcpp.framework →
+        # Frameworks (4 hops). E57Format.framework is a sibling at
+        # Frameworks/.
+        install_name_tool -add_rpath \
+            "@loader_path/../../../../E57Format.framework/Versions/A" \
+            "$plug" 2>/dev/null || true
     done
     echo "copied ${#plugin_files[@]} plugin(s)"
 fi
@@ -468,7 +484,12 @@ PY
     local plugin_src="${SRC_DIR}/plugins/e57/io"
     local plugin_includes=(
         -I"${install_dir_ios}/include"
+        # E57Format headers ship under Headers/E57Format/ (matches the
+        # `<E57Format/...>`-style includes consumers like SwiftPDAL's
+        # CxxPDAL use). PDAL's plugin sources include `<E57Format.h>`
+        # bare, so also expose the inner dir as an -I to satisfy that.
         -I"${e57_headers}"
+        -I"${e57_headers}/E57Format"
         -I"${SRC_DIR}/vendor"
         -I"${SRC_DIR}/vendor/nlohmann"
         -I"${plugin_src}"
