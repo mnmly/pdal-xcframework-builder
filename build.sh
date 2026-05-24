@@ -332,6 +332,15 @@ build_ios_slice() {
     local sdk_root
     sdk_root="$(xcrun --sdk "${sdk_id}" --show-sdk-path)"
 
+    # libcurl: PDAL's arbiter eagerly constructs an HTTP Pool on
+    # startup. iOS SDK ships no libcurl, so we cross-build a minimal
+    # static curl (HTTPS via SecureTransport, no extras). Bundled into
+    # the framework binary at the ld -r merge step below.
+    local curl_version="${CURL_VERSION:-8.10.1}"
+    local curl_prefix="${ROOT}/work/deps-cache/ios-${sdk}/curl-${curl_version}"
+    CURL_VERSION="${curl_version}" \
+        "${ROOT}/scripts/deps/curl.sh" "${sdk}" "${curl_prefix}"
+
     local gdal_dir="${GDAL_XCFRAMEWORK}/${slice_name}/gdal.framework/lib/cmake/gdal"
     local proj_dir="${PROJ_XCFRAMEWORK}/${slice_name}/proj.framework/lib/cmake/proj"
     local e57_fw="${E57FORMAT_XCFRAMEWORK_RESOLVED}/${slice_name}/E57Format.framework"
@@ -415,8 +424,8 @@ PY
         -DPROJ_INCLUDE_DIR="${proj_fw}/Headers" \
         -DTIFF_LIBRARY="${gdal_dir}/.." \
         -DTIFF_INCLUDE_DIR="${gdal_dir}/.." \
-        -DCURL_LIBRARY="${sdk_root}/usr/lib/libcurl.tbd" \
-        -DCURL_INCLUDE_DIR="$(brew --prefix curl)/include" \
+        -DCURL_LIBRARY="${curl_prefix}/lib/libcurl.a" \
+        -DCURL_INCLUDE_DIR="${curl_prefix}/include" \
         -DGEOTIFF_LIBRARY="${gdal_dir}/.." \
         -DGEOTIFF_INCLUDE_DIR="${ROOT}/scripts/stubs/include" \
         -DZLIB_LIBRARY="${sdk_root}/usr/lib/libz.tbd" \
@@ -501,6 +510,7 @@ PY
         "${build_dir_ios}/vendor/arbiter/libpdal_arbiter.a"
         "${build_dir_ios}/vendor/lepcc/libpdal_lepcc.a"
         "${build_dir_ios}/vendor/schema-validator/libpdal_json_schema.a"
+        "${curl_prefix}/lib/libcurl.a"
     )
     local ld_inputs=( -force_load "${libpdal}" )
     for v in "${vendor_libs[@]}"; do

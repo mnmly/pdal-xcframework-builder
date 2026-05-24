@@ -529,3 +529,37 @@ Phase 4 (build.sh iOS slices) requires GDAL builder's iOS slices (`gdal.xcframew
   - SwiftPM Package.swift declares 4 binaryTargets, builds for iOS Simulator + device.
   - Smoke test exercises both core (`readers.las`) and plugin (`readers.e57`) registration.
   - macOS slice regression: diff-frameworks.sh no-op.
+
+## 2026-05-24 — Phase 7: SwiftPDAL iOS integration
+
+- `Package.swift` adds `.iOS("17.0")` platform.
+- All xcframeworks switched to `path:` binaryTargets (Frameworks/ mirror) for local iteration.
+- `proj` binary target added (iOS-only artifact from gdal-builder).
+- `CxxPDAL` target gets iOS-conditional settings:
+  - `-I Frameworks/pdalcpp.xcframework/ios-arm64/pdalcpp.framework/Headers` (for `<pdal/...>` includes)
+  - Linked libs: z, iconv, xml2, sqlite3, c++ (system)
+  - Linked frameworks: Security, CoreFoundation, SystemConfiguration (for libcurl's SecureTransport TLS path)
+- `StreamingBench` source wrapped in `#if os(macOS)` — dev-only CLI, not meaningful on iOS.
+- 20/23 SwiftPDAL tests pass on iOS Simulator (iPhone 17 Pro, iOS 26.3.1):
+  - All LAZ reads, COPC streaming, conversions, cancellation, progress.
+  - `convertPlyToLaz`, `convertLazRoundTrip`, `convertReportsProgress`.
+  - All streaming LOD/budget/halo/eviction tests.
+- 3 failures, all SwiftPDAL-side (not builder concerns):
+  - `readE57File` / `streamingReadE57File`: PDAL pipeline adds `filters.reprojection` which errors because `bunnyFloat.e57` has no SRS. Same failure mode on any platform with this input.
+  - `streamingSource_wantedSet_stableAcrossTicksWhenViewUnchanged`: cache-hit timing flake, unrelated.
+
+### libcurl cross-build (followup discovered during Phase 7)
+
+Initial Phase 7 attempt with `-Wl,-undefined,dynamic_lookup` for curl crashed
+*every* test at startup in `pdal::arbiter::http::Pool::Pool` — PDAL's arbiter
+eagerly constructs an HTTP Pool on startup, not lazily, so runtime resolution
+of curl symbols was insufficient.
+
+Solution: `scripts/deps/curl.sh` cross-builds libcurl statically for iOS
+(SecureTransport TLS, no other protocols/deps) and `build_ios_slice` merges
+it into `pdalcpp.framework`'s binary at the `ld -r` step alongside the PDAL
+vendor archives. CURL_VERSION pinned to 8.10.1.
+
+Gotcha logged: curl 8.10.1's CMake flag for disabling libidn2 is `USE_LIBIDN2=OFF`,
+not `CURL_USE_LIBIDN2=OFF` (the latter is silently treated as uninitialized and
+curl auto-detects Homebrew's libidn2 from pkgconfig).

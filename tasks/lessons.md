@@ -365,3 +365,44 @@ treatment OR ship a cross-built libcurl iOS slice (curl builds for
 iOS without too much pain — autoconf + iOS toolchain). Document as
 a follow-up: if any SwiftPDAL pipeline uses EPT/COPC-remote, libcurl
 must actually be available on iOS at runtime.
+
+**Updated 2026-05-24.** `-Wl,-undefined,dynamic_lookup` does NOT work
+for PDAL on iOS. PDAL's `arbiter::http::Pool::Pool` is constructed
+*eagerly on startup* (not lazily), so curl symbols are dereferenced
+before any local-file pipeline runs. Every test crashed at the same
+constructor. Real fix: cross-build libcurl statically. See next entry.
+
+---
+
+## 2026-05-24 — Cross-built libcurl for iOS (scripts/deps/curl.sh)
+
+**Decision.** Cross-build a minimal libcurl for iOS, merge into
+`pdalcpp.framework`'s binary alongside PDAL vendor archives. Curl's
+CMake build is well-behaved; iOS only needs HTTPS via SecureTransport.
+
+**Script** (`scripts/deps/curl.sh`) mirrors `scripts/deps/xerces-c.sh`:
+- Shallow clone curl at `CURL_VERSION` (default 8.10.1).
+- CMake configure with iOS toolchain, `BUILD_SHARED_LIBS=OFF`,
+  SecureTransport for TLS, everything else off.
+- `lipo -archs` validation, idempotent skip if archive present.
+
+**Disabled protocols/deps** (keeps the archive small and dep-free):
+LDAP, RTSP, DICT, FILE, FTP, GOPHER, IMAP, POP3, SMB, SMTP, TELNET,
+TFTP, MQTT, OpenSSL, MbedTLS, WolfSSL, libssh, libssh2, libpsl,
+libidn2, brotli, zstd. Just HTTP/HTTPS over SecureTransport.
+
+**Gotcha: curl's option naming.** The flag to disable libidn2 is
+`USE_LIBIDN2=OFF` (no `CURL_` prefix). `CURL_USE_LIBIDN2=OFF` is
+silently treated as uninitialized and curl auto-detects Homebrew's
+libidn2 via pkgconfig — resulting `libcurl.a` references
+`idn2_check_version`, `idn2_lookup_ul`, etc., which break consumer link.
+Verify with `nm libcurl.a | grep idn2 | head` after build.
+
+**Consumer side (SwiftPDAL).** Removed
+`-Wl,-undefined,dynamic_lookup` and `linkedLibrary("curl")`. Added
+`linkedFramework("Security"|"CoreFoundation"|"SystemConfiguration")`
+for SecureTransport's runtime dependencies on iOS.
+
+**Outcome.** 20/23 SwiftPDAL tests pass on iOS Simulator. Remaining
+3 failures are unrelated (E57 file has no SRS for reprojection
+filter; cache-hit timing flake).
