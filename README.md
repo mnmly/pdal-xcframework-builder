@@ -1,6 +1,17 @@
 # pdal-xcframework-builder
 
-Standalone builder that produces `pdalcpp.xcframework` and `E57Format.xcframework` for macOS arm64 (dynamic) and iOS arm64 device + simulator (static). Mirrors `gdal-xcframework-builder` — keeps the recipe outside the PDAL source tree.
+Standalone builder that produces four xcframeworks for **macOS arm64 (dynamic) + iOS arm64 device/simulator (static)** from any tagged upstream PDAL release. Mirrors `gdal-xcframework-builder` — keeps the recipe outside the PDAL source tree.
+
+When `BUILD_IOS=1`:
+
+| Artifact | Slices | Shape |
+| --- | --- | --- |
+| `pdalcpp.xcframework` | macOS arm64 | dynamic `.framework` with dylibbundler'd deps |
+| `pdalcpp-ios.xcframework` | ios-arm64 + ios-arm64-simulator | library xcframework (`.a` + `Headers/`) |
+| `E57Format.xcframework` | macOS arm64 | dynamic `.framework` with xerces-c bundled |
+| `E57Format-ios.xcframework` | ios-arm64 + ios-arm64-simulator | library xcframework |
+
+xcodebuild rejects mixing framework + library slices in one xcframework, hence the `-ios.xcframework` siblings. See `CLAUDE.md`'s "iOS pipeline" section for the why.
 
 ## Prerequisites
 
@@ -77,13 +88,22 @@ When `BUILD_IOS=1`, the macOS phases above run unchanged, then a sibling `build_
 
 ### Consumer-side notes
 
-The framework's `Headers/pdal/...` nested layout means `<pdal/StageFactory.hpp>`-style includes don't resolve through xcodebuild's default `-F` flag alone. Consumers need an explicit `-I path/to/pdalcpp.framework/Headers` in their C++ target settings. SwiftPDAL's `CxxPDAL` target uses this pattern.
+iOS consumers link the library xcframeworks statically. Two things are needed in the consumer's Xcode project (not Package.swift — SwiftPM's `.unsafeFlags` rejects Xcode variables):
 
-iOS consumers must also link:
+```
+OTHER_LDFLAGS[sdk=iphoneos*]        = -Wl,-force_load,$(BUILT_PRODUCTS_DIR)/libpdalcpp.a
+OTHER_LDFLAGS[sdk=iphonesimulator*] = -Wl,-force_load,$(BUILT_PRODUCTS_DIR)/libpdalcpp.a
+```
+
+Without `force_load`, PDAL's file-scope plugin registrars get dropped by ld and `StageFactory::createStage("readers.las")` returns null at runtime. Per-archive (not blanket `-all_load`) — copclib.xcframework also bundles lazperf and `-all_load` would duplicate-symbol-error.
+
+Also link:
 - System libs: `z`, `iconv`, `xml2`, `sqlite3`, `c++`
 - Apple frameworks: `Security`, `CoreFoundation`, `SystemConfiguration` (libcurl's SecureTransport TLS runtime deps)
 
-See `verify/ios-sample/Package.swift` and SwiftPDAL's `Package.swift` for working examples.
+macOS consumers just link `-framework pdalcpp -framework E57Format`. No force_load, no extra system libs (they're in the dynamic framework's `Libraries/`).
+
+See SwiftPDAL's `Package.swift` and `Examples/PDALApp/` for working consumer examples on all three Apple platforms (macOS, iOS Simulator, iOS device).
 
 ### Verify harness
 

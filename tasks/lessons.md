@@ -406,3 +406,158 @@ for SecureTransport's runtime dependencies on iOS.
 **Outcome.** 20/23 SwiftPDAL tests pass on iOS Simulator. Remaining
 3 failures are unrelated (E57 file has no SRS for reprojection
 filter; cache-hit timing flake).
+
+---
+
+## 2026-05-24 — Framework→library xcframework split for iOS
+
+**Symptom.** iOS app embed corrupts MH_OBJECT framework binaries —
+Xcode's pipeline silently strips an 8.6 MB framework binary down to
+~50 KB at embed time, and `installd` rejects the .app with
+`MIInstallerErrorDomain Code 35 PackageInspectionFailed` /
+"had none of the keys that we expect" (misleading; the keys are
+present — the binary itself is the problem).
+
+We also tried ar-archive framework binaries — `xcodebuild
+-create-xcframework -framework` rejects with "Unknown header:
+0xb17c0de" because the framework binary needs to be a Mach-O, not
+an ar archive.
+
+**Fix.** Drop the framework wrapper for iOS slices entirely. Ship
+each iOS slice as a library xcframework (`<slice>/lib<name>.a` +
+optional `<slice>/Headers/`). `xcodebuild -create-xcframework -library`
+accepts ar archives natively; Xcode auto-links `.a` files via
+`-L <path> -l<name>` and the static symbols land in the consumer's
+binary directly. No `.framework` to embed, nothing for `installd`
+to validate.
+
+**Constraint.** `xcodebuild` rejects mixing framework + library
+slices in one xcframework. So each builder now produces TWO
+artifacts:
+- `pdalcpp.xcframework` (macOS framework slice only)
+- `pdalcpp-ios.xcframework` (iOS device + simulator library slices)
+- Same for E57Format.
+
+Consumer Package.swift declares both as `.binaryTarget` with
+platform-conditional dependencies.
+
+---
+
+## 2026-05-24 — libtool -static over ld -r for library xcframeworks
+
+`xcodebuild -create-xcframework -library <file>` requires the input
+to be a static archive (`.a`). `ld -r` produces a single MH_OBJECT
+Mach-O — not an archive, rejected. Use `libtool -static -arch_only arm64`
+instead. PDAL's duplicate `.o` basenames (`Expression.cpp.o` in two
+filter subdirs) are handled correctly by libtool — ar archives
+address members by index, not name.
+
+---
+
+## 2026-05-24 — libE57Format thin-LTO produces bitcode `.o` files
+
+**Symptom.** `xcodebuild -create-xcframework -library libE57Format.a`
+rejects with "Unknown header: 0xb17c0de" — LLVM bitcode magic.
+
+**Cause.** libE57Format's CMakeLists enables thin-LTO in Release
+builds via `option(E57_RELEASE_LTO ON)`. With LTO on, clang emits
+LLVM bitcode `.o` files instead of native Mach-O. xcframework
+creation rejects bitcode archives.
+
+**Fix.** Pass `-DE57_RELEASE_LTO=OFF` in `build_e57.sh`'s iOS
+configure. Already in place. Note: this disables LTO; minor perf
+hit vs. native Mach-O `.o` files, acceptable.
+
+---
+
+## 2026-05-24 — Static-plugin registrar force_load on consumer side
+
+PDAL's plugin registrars are file-scope statics
+(`static bool LasReader_b = registerPlugin(...)`). With a static
+archive, ld only pulls members that are directly referenced.
+Registrars in unreferenced `.o` files get dropped, and
+`StageFactory::createStage("readers.las")` returns null at runtime.
+
+`-Wl,-force_load,<archive>` on the consumer side keeps the
+registrars alive. Per-archive `-force_load` (not blanket `-all_load`)
+because SwiftPDAL also depends on `copclib.xcframework` which bundles
+its own lazperf — `-all_load` would pull both copies of lazperf and
+fail with duplicate-symbol errors.
+
+**Consumer-side complication.** SwiftPM `.unsafeFlags` rejects Xcode
+build variables like `$(BUILT_PRODUCTS_DIR)`. The flag has to live in
+the app target's Xcode build settings:
+
+```
+OTHER_LDFLAGS[sdk=iphoneos*]        = -Wl,-force_load,$(BUILT_PRODUCTS_DIR)/libpdalcpp.a
+OTHER_LDFLAGS[sdk=iphonesimulator*] = -Wl,-force_load,$(BUILT_PRODUCTS_DIR)/libpdalcpp.a
+```
+
+Documented in `CLAUDE.md` "Consumer-side requirements". SwiftPDAL's
+`Examples/PDALApp/PDALApp.xcodeproj` is the canonical example.
+
+---
+
+## 2026-05-24 — macOS E57 plugin needs second rpath for libE57Format
+
+The vendored E57 plugin (`libpdal_plugin_reader_e57.dylib`) links
+against `@rpath/libE57Format.3.dylib`. The default
+`@loader_path/../../..` rpath added in `build.sh` phase 4 only
+resolves up to `pdalcpp.framework/`, not the sibling
+`E57Format.framework/`.
+
+E57Format.framework is at `Contents/Frameworks/E57Format.framework/`,
+sibling to `pdalcpp.framework/`. From the plugin at
+`pdalcpp.framework/Versions/A/PlugIns/`, that's 4 `../` hops:
+PlugIns → Versions/A → Versions → pdalcpp.framework → Frameworks/.
+
+Add a second rpath in the plugin processing loop:
+
+```
+install_name_tool -add_rpath \
+    "@loader_path/../../../../E57Format.framework/Versions/A" \
+    "$plug"
+```
+
+Plugins that don't reference libE57Format ignore the extra rpath
+harmlessly.
+
+---
+
+## 2026-05-24 — iOS bundle resource layout differs from macOS
+
+SwiftPDAL's `getPaths(isTesting: false)` was hardcoded to
+`Bundle.module.bundleURL.appendingPathComponent("Contents/Resources")`
+— macOS framework-bundle convention. On iOS, SwiftPM resource bundles
+are flat: resources sit directly under the `.bundle` root, no
+`Contents/Resources/` subdirectory.
+
+Fix in `Sources/SwiftPDAL/SwiftPDAL.swift`:
+
+```swift
+#if os(iOS)
+let projDBURL = Bundle.module.bundleURL.path()
+let driversURL = ""  // no loadable plugins on iOS
+#else
+let projDBURL = Bundle.module.bundleURL.appendingPathComponent("Contents/Resources").path()
+let driversURL = ...
+#endif
+```
+
+iOS also has no plugin dir (pdalcpp is statically linked), so we pass
+an empty `driversURL` to disable PDAL's plugin-discovery scan.
+
+---
+
+## 2026-05-24 — Reprojection requires source SRS (PLY/E57 fix)
+
+`filters.reprojection` errors out at `prepare()` with "source data has
+no spatial reference and none is specified with the 'in_srs' option"
+when the source file lacks an SRS. Common for E57 and PLY files which
+typically use local coordinates.
+
+**Fix in SwiftPDAL's pdal_wrapper.cpp.** Probe the source's
+`getSpatialReference()` in a throwaway PointTable before deciding
+whether to add `filters.reprojection`. Skip the filter when the
+source has no SRS or when probing throws. Files with proper SRS still
+get reprojected; files without don't crash.
