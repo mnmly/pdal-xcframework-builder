@@ -26,6 +26,7 @@ This builder reproduces the framework structure entirely in shell after a normal
 ## Pipeline (build.sh, 8 phases)
 
 1. **Fetch** — clone upstream PDAL at tag (auto-detects `<version>` or `v<version>` via `git ls-remote`; override with `PDAL_TAG`).
+1.5. **Patch vendored lazperf** — `git apply` every `*.patch` in `LAZPERF_PATCHES_DIR` (default `resources/lazperf-patches/`) to `src/vendor/lazperf/`. See "lazperf ABI alignment" below.
 2. **Configure** — standard install layout (no framework cmake). Links against:
    - `-DGDAL_DIR=${GDAL_XCFRAMEWORK}/macos-arm64/gdal.framework/Versions/Current/lib/cmake/gdal`
    - `-DPROJ_DIR=${PROJ_PREFIX}/lib/cmake/proj`
@@ -67,6 +68,7 @@ This builder reproduces the framework structure entirely in shell after a normal
 - `PDAL_TAG` (override tag auto-detection)
 - `EXTRA_CMAKE_FLAGS`
 - `DYLIBBUNDLER_SEARCH_PATHS` (default includes homebrew lib + expat + xerces-c)
+- `LAZPERF_PATCHES_DIR` (default `${ROOT}/resources/lazperf-patches`; set empty to disable)
 
 ## Known issues fixed vs. the user's previous hand-built framework
 
@@ -134,6 +136,14 @@ For library xcframeworks, `xcodebuild -create-xcframework -library` requires an 
 ### Disable LTO in libE57Format
 
 libE57Format's CMake enables thin-LTO in Release builds (`E57_RELEASE_LTO ON`), producing LLVM bitcode `.o` files. `xcodebuild -create-xcframework -library` rejects bitcode archives with "Unknown header: 0xb17c0de". Pass `-DE57_RELEASE_LTO=OFF` in `build_e57.sh`'s iOS configure to force native Mach-O `.o` output.
+
+## lazperf ABI alignment (phase 1.5, persistent in worktree)
+
+PDAL vendors an older laz-perf snapshot at `src/vendor/lazperf/`. SwiftPDAL's `copclib.xcframework` bundles upstream `hobuinc/laz-perf@master` plus a local patch that adds `virtual void las_decompressor::reset(InputCb)` — a new vtable slot. When both archives are force-loaded into one iOS consumer binary, vtables disagree and copclib's virtual dispatch lands on the wrong slot → `__cxa_pure_virtual` at runtime from `point_decompressor_0::decompress`.
+
+Phase 1.5 applies the same API surface (slightly adapted context lines) to PDAL's vendored copy so both archives ship matching vtables. The patch lives at `resources/lazperf-patches/0001-add-reset-api.patch` (see its README for context-line drift vs SwiftPDAL's authoritative copy).
+
+Unlike the CMake patches below, this one is **not** reverted on function exit — it mutates the source tree for the duration of the build, applies to both macOS and iOS slices, and is idempotent (reverse-check first). If you rerun the builder against the same `work/`, the patch's already-applied check short-circuits.
 
 ## Upstream PDAL patches (configure-time, restored on RETURN)
 

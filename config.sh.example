@@ -40,6 +40,14 @@ PDAL_TAG=""
 # Extra cmake flags appended to the configure step.
 EXTRA_CMAKE_FLAGS=""
 
+# Directory of *.patch files applied to PDAL's vendored lazperf source
+# (src/vendor/lazperf/) in phase 1.5, before any slice configures.
+# Used to keep lazperf's vtable ABI aligned with copclib.xcframework's
+# patched lazperf — without this, iOS consumers force-loading both
+# archives crash with __cxa_pure_virtual on COPC decompression.
+# Default: ${ROOT}/resources/lazperf-patches/. Set to empty to disable.
+# LAZPERF_PATCHES_DIR=""
+
 # ─── iOS slices (opt-in) ───────────────────────────────────────────────
 # Set BUILD_IOS=1 to also build iOS device + simulator static slices
 # alongside the macOS dynamic slice. Both build.sh and build_e57.sh

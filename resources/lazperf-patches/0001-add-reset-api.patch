@@ -1,0 +1,402 @@
+diff --git a/cpp/lazperf/decoder.hpp b/cpp/lazperf/decoder.hpp
+index 33eaa4d..d813400 100644
+--- a/cpp/lazperf/decoder.hpp
++++ b/cpp/lazperf/decoder.hpp
+@@ -334,6 +334,15 @@ public:
+ 
+     arithmetic<TInputStream>& operator = (const arithmetic<TInputStream>&) = delete;
+ 
++    // Reset range-coder state and the internal stream so this decoder can be
++    // reused for a new chunk. Does not free or reallocate the underlying
++    // TInputStream (e.g. MemoryStream buffer capacity is preserved).
++    void reset()
++    {
++        instream.reset();
++        init();
++    }
++
+ private:
+     void init()
+     {
+diff --git a/cpp/lazperf/decompressor.hpp b/cpp/lazperf/decompressor.hpp
+index f5ccf94..b4d46e2 100644
+--- a/cpp/lazperf/decompressor.hpp
++++ b/cpp/lazperf/decompressor.hpp
+@@ -100,6 +100,16 @@ namespace decompressors
+ 				}
+ 			}
+ 
++			// Reset arithmetic-model state so this decompressor can be reused
++			// against a new chunk. Preserves heap allocations inside mBits /
++			// mCorrector. Safe to call only after init() has populated them.
++			void reset() {
++				k = 0;
++				mCorrector0.reset();
++				for (auto& m : mBits)      m.reset();
++				for (auto& m : mCorrector) m.reset();
++			}
++
+ 			template<
+ 				typename TDecoder
+ 			>
+diff --git a/cpp/lazperf/detail/field_byte14.cpp b/cpp/lazperf/detail/field_byte14.cpp
+index 70ba42e..b04cac5 100644
+--- a/cpp/lazperf/detail/field_byte14.cpp
++++ b/cpp/lazperf/detail/field_byte14.cpp
+@@ -183,5 +183,14 @@ char *Byte14Decompressor::decompress(char *buf, int& sc)
+     return buf;
+ }
+ 
++void Byte14Decompressor::reset()
++{
++    for (auto& c : chan_ctxs_)
++        c.resetForDecode();
++    last_channel_ = -1;
++    for (auto& v : byte_cnt_) v = 0;
++    for (auto& d : byte_dec_) d.reset();
++}
++
+ } // namespace detail
+ } // namespace lazperf
+diff --git a/cpp/lazperf/detail/field_byte14.hpp b/cpp/lazperf/detail/field_byte14.hpp
+index 9cbc263..7cf1093 100644
+--- a/cpp/lazperf/detail/field_byte14.hpp
++++ b/cpp/lazperf/detail/field_byte14.hpp
+@@ -45,6 +45,12 @@ protected:
+         ChannelCtx(size_t count) : have_last_(false), last_(count),
+             byte_model_(count, models::arithmetic(256))
+         {}
++
++        void resetForDecode() {
++            have_last_ = 0;
++            std::fill(last_.begin(), last_.end(), 0);
++            for (auto& m : byte_model_) m.reset();
++        }
+     };
+ 
+ public:
+@@ -83,6 +89,7 @@ public:
+     void readSizes();
+     void readData();
+     char *decompress(char *buf, int& sc);
++    void reset();
+ 
+ private:
+     InCbStream& stream_;
+diff --git a/cpp/lazperf/detail/field_nir14.cpp b/cpp/lazperf/detail/field_nir14.cpp
+index 497d583..aad0f86 100644
+--- a/cpp/lazperf/detail/field_nir14.cpp
++++ b/cpp/lazperf/detail/field_nir14.cpp
+@@ -178,5 +178,14 @@ char *Nir14Decompressor::decompress(char *buf, int& sc)
+     return buf + sizeof(las::nir14);
+ }
+ 
++void Nir14Decompressor::reset()
++{
++    for (auto& c : chan_ctxs_)
++        c.resetForDecode();
++    last_channel_ = -1;
++    nir_cnt_ = 0;
++    nir_dec_.reset();
++}
++
+ } // namespace detail
+ } // namespace lazperf
+diff --git a/cpp/lazperf/detail/field_nir14.hpp b/cpp/lazperf/detail/field_nir14.hpp
+index 9d83327..65ba6ab 100644
+--- a/cpp/lazperf/detail/field_nir14.hpp
++++ b/cpp/lazperf/detail/field_nir14.hpp
+@@ -46,6 +46,13 @@ protected:
+         ChannelCtx() : have_last_{false}, used_model_(4),
+             diff_model_{ models::arithmetic(256), models::arithmetic(256) }
+         {}
++
++        void resetForDecode() {
++            have_last_ = 0;
++            last_ = las::nir14{};
++            used_model_.reset();
++            for (auto& m : diff_model_) m.reset();
++        }
+     };
+ 
+     std::array<ChannelCtx, 4> chan_ctxs_;
+@@ -77,6 +84,7 @@ public:
+     void readSizes();
+     void readData();
+     char *decompress(char *buf, int& sc);
++    void reset();
+ 
+ private:
+     InCbStream& stream_;
+diff --git a/cpp/lazperf/detail/field_point14.cpp b/cpp/lazperf/detail/field_point14.cpp
+index db4f14a..c85700c 100644
+--- a/cpp/lazperf/detail/field_point14.cpp
++++ b/cpp/lazperf/detail/field_point14.cpp
+@@ -916,5 +916,23 @@ void Point14Decompressor::decodeGpsTime(ChannelCtx& c)
+     c.last_.setGpsTime(c.last_gpstime_[c.last_gps_seq_]);
+ }
+ 
++void Point14Decompressor::reset(InCbStream& stream)
++{
++    stream_ = stream;             // value member; copies the InCbStream
++    sizes_.clear();
++    for (auto& c : chan_ctxs_)
++        c.resetForDecode();
++    last_channel_ = -1;
++    xy_dec_.reset();
++    z_dec_.reset();
++    class_dec_.reset();
++    flags_dec_.reset();
++    intensity_dec_.reset();
++    scan_angle_dec_.reset();
++    user_data_dec_.reset();
++    point_source_id_dec_.reset();
++    gpstime_dec_.reset();
++}
++
+ } // namespace detail
+ } // namespace lazperf
+diff --git a/cpp/lazperf/detail/field_point14.hpp b/cpp/lazperf/detail/field_point14.hpp
+index 11205ea..8105100 100644
+--- a/cpp/lazperf/detail/field_point14.hpp
++++ b/cpp/lazperf/detail/field_point14.hpp
+@@ -119,6 +119,44 @@ protected:
+             for (auto& yd : last_y_diff_median5_)
+                 yd.init();
+         }
++
++        // Reset all decode-side state to post-construction values without
++        // releasing heap allocations inside the model vectors. The compressor-
++        // side members (dx_compr_ etc.) are left untouched because they are
++        // never used during decompression.
++        void resetForDecode() {
++            for (auto& m : changed_values_model_) m.reset();
++            scanner_channel_model_.reset();
++            rn_gps_same_model_.reset();
++            for (auto& m : nr_model_)        m.reset();
++            for (auto& m : rn_model_)        m.reset();
++            for (auto& m : class_model_)     m.reset();
++            for (auto& m : flag_model_)      m.reset();
++            for (auto& m : user_data_model_) m.reset();
++            gpstime_multi_model_.reset();
++            gpstime_0diff_model_.reset();
++
++            dx_decomp_.reset();
++            dy_decomp_.reset();
++            z_decomp_.reset();
++            intensity_decomp_.reset();
++            scan_angle_decomp_.reset();
++            point_source_id_decomp_.reset();
++            gpstime_decomp_.reset();
++
++            have_last_ = false;
++            last_ = las::point14{};
++            last_intensity_.fill(0);
++            last_z_.fill(0);
++            for (auto& xd : last_x_diff_median5_) xd.init();
++            for (auto& yd : last_y_diff_median5_) yd.init();
++            last_gps_seq_ = 0;
++            next_gps_seq_ = 0;
++            last_gpstime_.fill(0);
++            last_gpstime_diff_.fill(0);
++            multi_extreme_counter_.fill(0);
++            gps_time_change_ = false;
++        }
+     };  // ChannelCtx
+ 
+     std::array<ChannelCtx, 4> chan_ctxs_;
+@@ -160,6 +198,9 @@ public:
+     void readSizes();
+     void readData();
+     char *decompress(char *buf, int& sc);
++    // Rebind the input stream and reset all model/coder state for a new
++    // chunk. Preserves heap allocations inside arithmetic models.
++    void reset(InCbStream& stream);
+ 
+ private:
+     void decodeGpsTime(ChannelCtx& c);
+diff --git a/cpp/lazperf/detail/field_rgb14.cpp b/cpp/lazperf/detail/field_rgb14.cpp
+index 860a0d5..993b1c3 100644
+--- a/cpp/lazperf/detail/field_rgb14.cpp
++++ b/cpp/lazperf/detail/field_rgb14.cpp
+@@ -292,5 +292,14 @@ char *Rgb14Decompressor::decompress(char *buf, int& sc)
+     return buf + sizeof(las::rgb14);
+ }
+ 
++void Rgb14Decompressor::reset()
++{
++    for (auto& c : chan_ctxs_)
++        c.resetForDecode();
++    last_channel_ = -1;
++    rgb_cnt_ = 0;
++    rgb_dec_.reset();
++}
++
+ } // namespace detail
+ } // namespace lazperf
+diff --git a/cpp/lazperf/detail/field_rgb14.hpp b/cpp/lazperf/detail/field_rgb14.hpp
+index d817c5e..1237241 100644
+--- a/cpp/lazperf/detail/field_rgb14.hpp
++++ b/cpp/lazperf/detail/field_rgb14.hpp
+@@ -48,6 +48,13 @@ protected:
+                 models::arithmetic(256), models::arithmetic(256),
+                 models::arithmetic(256), models::arithmetic(256) }
+         {}
++
++        void resetForDecode() {
++            have_last_ = 0;
++            last_ = las::rgb14{};
++            used_model_.reset();
++            for (auto& m : diff_model_) m.reset();
++        }
+     };
+ 
+     std::array<ChannelCtx, 4> chan_ctxs_;
+@@ -79,6 +86,7 @@ public:
+     void readSizes();
+     void readData();
+     char *decompress(char *buf, int& sc);
++    void reset();
+ 
+ private:
+     InCbStream& stream_;
+diff --git a/cpp/lazperf/lazperf.cpp b/cpp/lazperf/lazperf.cpp
+index 898bd13..c209edf 100644
+--- a/cpp/lazperf/lazperf.cpp
++++ b/cpp/lazperf/lazperf.cpp
+@@ -272,6 +272,11 @@ void point_compressor_8::done()
+ las_decompressor::~las_decompressor()
+ {}
+ 
++void las_decompressor::reset(InputCb /*cb*/)
++{
++    throw std::runtime_error("reset() not implemented for this decompressor");
++}
++
+ // 1.2 DECOMPRESSOR BASE
+ 
+ struct point_decompressor_base_1_2::Private
+@@ -398,7 +403,22 @@ public:
+ point_decompressor_base_1_4::point_decompressor_base_1_4(InputCb cb, size_t ebCount) :
+     p_(new Private(cb, ebCount))
+ {}
+-    
++
++void point_decompressor_base_1_4::reset(InputCb cb)
++{
++    // Rebind the outer input stream. Rgb14/Nir14/Byte14 hold InCbStream
++    // references into cbStream_ so they see this update automatically; the
++    // Point14Decompressor holds an InCbStream *value* and needs to be told
++    // about the rebind explicitly.
++    p_->cbStream_.setCallback(std::move(cb));
++    p_->point_.reset(p_->cbStream_);
++    p_->rgb_.reset();
++    p_->nir_.reset();
++    p_->byte_.reset();
++    p_->chunk_count_ = 0;
++    p_->first_ = true;
++}
++
+ // DECOMPRESSOR 6
+ 
+ point_decompressor_6::point_decompressor_6(InputCb cb, size_t ebCount) :
+diff --git a/cpp/lazperf/lazperf.hpp b/cpp/lazperf/lazperf.hpp
+index 7ca915e..09d9e36 100644
+--- a/cpp/lazperf/lazperf.hpp
++++ b/cpp/lazperf/lazperf.hpp
+@@ -60,6 +60,11 @@ public:
+     typedef std::shared_ptr<las_decompressor> ptr;
+ 
+     virtual char *decompress(char *in) = 0;
++    // Rebind the input source and reset all internal state so this
++    // decompressor can be reused against a new LAZ chunk. Preserves heap
++    // allocations inside arithmetic models. Default impl throws; only
++    // point_decompressor_base_1_4 currently overrides.
++    LAZPERF_EXPORT virtual void reset(InputCb cb);
+     virtual ~las_decompressor();
+ };
+ 
+@@ -217,6 +222,7 @@ class point_decompressor_base_1_4 : public las_decompressor
+ 
+ public:
+     virtual char *decompress(char *out) = 0;
++    LAZPERF_EXPORT void reset(InputCb cb) override;
+ 
+ protected:
+     point_decompressor_base_1_4(InputCb cb, size_t ebCount);
+diff --git a/cpp/lazperf/model.hpp b/cpp/lazperf/model.hpp
+index 64e99e0..9613988 100644
+--- a/cpp/lazperf/model.hpp
++++ b/cpp/lazperf/model.hpp
+@@ -144,6 +144,23 @@ namespace models
+ 				return *this;
+ 			}
+ 
++			// Reset all dynamic state to the post-construction values without
++			// reallocating distribution/symbol_count/decoder_table. Used by
++			// the pooled-decompressor path so a decoder instance can be reused
++			// across LAZ chunks.
++			void reset(uint32_t *initTable = nullptr) {
++				total_count = 0;
++				update_cycle = symbols;
++
++				if (initTable)
++					for (uint32_t k = 0; k < symbols; k++) symbol_count[k] = initTable[k];
++				else
++					for (uint32_t k = 0; k < symbols; k++) symbol_count[k] = 1;
++
++				update();
++				symbols_until_update = update_cycle = (symbols + 6) >> 1;
++			}
++
+ 			inline void update() {
+ 				// halve counts when a threshold is reached
+ 				if ((total_count += update_cycle) > DM__MaxCount) {
+@@ -224,6 +241,14 @@ namespace models
+ 				return *this;
+ 			}
+ 
++			// See models::arithmetic::reset.
++			void reset() {
++				bit_0_count = 1;
++				bit_count   = 2;
++				bit_0_prob  = 1U << (BM__LengthShift - 1);
++				update_cycle = bits_until_update = 4;
++			}
++
+ 			void update() {
+ 				// halve counts when a threshold is reached
+ 				if ((bit_count += update_cycle) > BM__MaxCount)
+diff --git a/cpp/lazperf/streams.hpp b/cpp/lazperf/streams.hpp
+index 344ed44..29c98ae 100644
+--- a/cpp/lazperf/streams.hpp
++++ b/cpp/lazperf/streams.hpp
+@@ -63,6 +63,13 @@ struct InCbStream
+     InCbStream(InputCb inCb) : inCb_(inCb)
+     {}
+ 
++    // Rebind to a different byte source. Used by the pooled-decompressor
++    // path so the decoder can be reused across LAZ chunks without rebuilding.
++    void setCallback(InputCb inCb)
++    {
++        inCb_ = std::move(inCb);
++    }
++
+     unsigned char getByte()
+     {
+         unsigned char c;
+@@ -83,6 +90,14 @@ struct MemoryStream
+     MemoryStream() : buf(), idx(0)
+     {}
+ 
++    // Clear contents without releasing capacity, so the same MemoryStream
++    // can absorb data for a fresh chunk without reallocating its buffer.
++    void reset()
++    {
++        buf.clear();
++        idx = 0;
++    }
++
+     void putBytes(const unsigned char* b, size_t len)
+     {
+         while(len --)

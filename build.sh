@@ -98,6 +98,50 @@ else
     echo "source already present at ${SRC_DIR}"
 fi
 
+############################################
+step "1.5  Patch vendored lazperf"
+############################################
+# PDAL vendors an older laz-perf snapshot at src/vendor/lazperf/. SwiftPDAL's
+# copclib.xcframework bundles upstream laz-perf master plus a local patch that
+# adds `virtual void las_decompressor::reset(InputCb)` (a new vtable slot). If
+# the two archives are linked into one consumer binary (iOS), their vtables
+# disagree and virtual dispatch from copclib lands on the wrong slot
+# (__cxa_pure_virtual at runtime). Apply the same patch here so both
+# archives expose an identical lazperf ABI.
+#
+# Applied to source (not at configure time) because lazperf is built by
+# PDAL's own CMake and we need the patched headers visible to every TU.
+# Idempotent: reverse-check first, skip if already applied. Mirrors the
+# pattern in SwiftPDAL/scripts/build-copc-xcframework.sh.
+: "${LAZPERF_PATCHES_DIR:=${ROOT}/resources/lazperf-patches}"
+if [ -d "${LAZPERF_PATCHES_DIR}" ]; then
+    shopt -s nullglob
+    lazperf_patches=( "${LAZPERF_PATCHES_DIR}"/*.patch )
+    shopt -u nullglob
+    for p in "${lazperf_patches[@]}"; do
+        pushd "${SRC_DIR}" >/dev/null
+        # Patch uses `a/cpp/lazperf/<file>` paths (it was authored against
+        # upstream hobuinc/laz-perf where headers live under cpp/lazperf/).
+        # PDAL's vendored copy is at vendor/lazperf/<file>. -p3 strips
+        # `a/cpp/lazperf/` down to the bare filename; --directory then
+        # prepends `vendor/lazperf/`. pushd into SRC_DIR first so the
+        # path is relative to PDAL's tree root.
+        if git apply --reverse --check -p3 --directory=vendor/lazperf "${p}" 2>/dev/null; then
+            echo "==> lazperf patch already applied: $(basename "${p}")"
+        elif git apply --check -p3 --directory=vendor/lazperf "${p}" 2>/dev/null; then
+            echo "==> Applying lazperf patch: $(basename "${p}")"
+            git apply -p3 --directory=vendor/lazperf "${p}"
+        else
+            echo "ERROR: lazperf patch $(basename "${p}") does not cleanly apply or reverse-apply" >&2
+            popd >/dev/null
+            exit 1
+        fi
+        popd >/dev/null
+    done
+else
+    echo "no lazperf patches dir at ${LAZPERF_PATCHES_DIR} — skipping"
+fi
+
 # ────────────────────────────────────────────────────────────────────
 # macOS slice (phases 2–7). iOS slices, when added, get a sibling
 # build_ios_slice() function called below. Each slice writes its
