@@ -84,23 +84,29 @@ platform-conditional dependencies.
 - pdalcpp.xcframework — PDAL 2.10.1 (macOS dynamic framework)
 - pdalcpp-ios.xcframework — PDAL 2.10.1 (iOS device/sim, library);
   E57 reader statically linked via plugin-static shim, libcurl +
-  xerces-c + all PDAL vendor archives merged
+  xerces-c + all PDAL vendor archives merged. Ships a
+  \`pdal_ensure_static_plugins()\` C entry point so consumers no
+  longer need any \`-force_load\` flag — calling it once anchors
+  the plugin-tree registrars (E57Reader, etc.) at link time.
 - E57Format.xcframework — libE57Format 3.3.0 (macOS) with bundled
   xerces-c 3.3.0
 - E57Format-ios.xcframework — libE57Format 3.3.0 (iOS device/sim)
 
-iOS consumers also need:
-  - OTHER_LDFLAGS[sdk=iphone*] = -Wl,-force_load,\$(BUILT_PRODUCTS_DIR)/libpdalcpp.a
-  - link \`-lz -liconv -lxml2 -lsqlite3 -lc++\`
-  - link Security, CoreFoundation, SystemConfiguration frameworks
+iOS consumers link:
+  - \`-lz -liconv -lxml2 -lsqlite3 -lc++\`
+  - Security, CoreFoundation, SystemConfiguration frameworks
 
 Built by gdal-xcframework-builder + pdal-xcframework-builder.
 "
 
+# Tag suffix (e.g. "r4") used for the GitHub release title. Falls back
+# to the full tag if it doesn't match the expected pattern.
+TAG_SUFFIX="$(printf '%s' "${TAG}" | grep -oE '[^-]+$' || echo "${TAG}")"
+
 echo "Creating GitHub release..."
 gh release create "${TAG}" \
     --repo "${REPO}" \
-    --title "GDAL 3.12.4 + PDAL 2.10.1 — Apple platforms (r2)" \
+    --title "GDAL 3.12.4 + PDAL 2.10.1 — Apple platforms (${TAG_SUFFIX})" \
     --notes "${NOTES}" \
     "${ASSETS[@]}"
 

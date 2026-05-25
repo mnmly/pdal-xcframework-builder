@@ -88,14 +88,15 @@ When `BUILD_IOS=1`, the macOS phases above run unchanged, then a sibling `build_
 
 ### Consumer-side notes
 
-iOS consumers link the library xcframeworks statically. Two things are needed in the consumer's Xcode project (not Package.swift — SwiftPM's `.unsafeFlags` rejects Xcode variables):
+iOS consumers link the library xcframeworks statically. PDAL's file-scope plugin registrars (`static bool LasReader_b = registerPlugin<LasReader>(info)`) would otherwise be dropped by ld64 for being referenced only inside their own TU, and `StageFactory::createStage("readers.las")` would return null at runtime.
 
-```
-OTHER_LDFLAGS[sdk=iphoneos*]        = -Wl,-force_load,$(BUILT_PRODUCTS_DIR)/libpdalcpp.a
-OTHER_LDFLAGS[sdk=iphonesimulator*] = -Wl,-force_load,$(BUILT_PRODUCTS_DIR)/libpdalcpp.a
-```
+Two cooperating mechanisms keep them alive:
 
-Without `force_load`, PDAL's file-scope plugin registrars get dropped by ld and `StageFactory::createStage("readers.las")` returns null at runtime. Per-archive (not blanket `-all_load`) — copclib.xcframework also bundles lazperf and `-all_load` would duplicate-symbol-error.
+1. **Downstream anchors** — for stages whose headers PDAL exposes (`pdal/io/LasReader.hpp`, `pdal/filters/RangeFilter.hpp`, etc.), the consumer instantiates one per TU it controls. SwiftPDAL does this in `Sources/CxxPDAL/pdal_static_plugins.cpp`.
+
+2. **In-archive anchor** — for plugin-tree stages whose headers PDAL does *not* expose (`plugins/e57/io/E57Reader.hpp`), this builder ships `scripts/pdal_static_anchors.cpp`. It's compiled with the plugin includes available and merged into `libpdalcpp.a`. Downstream calls `extern "C" void pdal_ensure_static_plugins()` once — that single reference drags the anchor TU out of the archive, which in turn drags each anchored plugin `.o` with it. Add new entries to `scripts/pdal_static_anchors.cpp` whenever a new plugin-tree static stage is added to the build.
+
+Consumers therefore no longer need any `OTHER_LDFLAGS` `-force_load` settings.
 
 Also link:
 - System libs: `z`, `iconv`, `xml2`, `sqlite3`, `c++`

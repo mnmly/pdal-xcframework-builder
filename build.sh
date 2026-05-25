@@ -512,6 +512,27 @@ PY
             -o "${plugin_objdir}/${src%.cpp}.o"
     done
 
+    # Static-plugin anchor TU. Exposes `extern "C" void
+    # pdal_ensure_static_plugins()` which downstream consumers call
+    # once to drag plugin-tree stages (E57Reader, etc.) out of the
+    # merged archive on iOS — where ld64 would otherwise strip them
+    # for being referenced only by a TU-internal `static bool _b`.
+    # See scripts/pdal_static_anchors.cpp for the rationale.
+    xcrun -sdk "${sdk_id}" clang++ \
+        -target "${triple}" \
+        -isysroot "${sdk_root}" \
+        -arch arm64 \
+        -std=c++17 \
+        -fPIC \
+        -O2 \
+        -fno-objc-arc \
+        -DPDAL_DLL_EXPORT \
+        -DARBITER_ZLIB -DARBITER_DLL_IMPORT \
+        -include "${ROOT}/scripts/plugin_static_shim.hpp" \
+        "${plugin_includes[@]}" \
+        -c "${ROOT}/scripts/pdal_static_anchors.cpp" \
+        -o "${plugin_objdir}/pdal_static_anchors.o"
+
     step "iOS/${sdk}: 4) Assemble library xcframework slice"
     # Library xcframework slice (not framework). Xcode's framework-embed
     # pipeline corrupts static iOS framework binaries: an MH_OBJECT
