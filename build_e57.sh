@@ -489,10 +489,15 @@ if [ "${RELEASE:-0}" = "1" ]; then
         echo "RELEASE=1 set but GH_RELEASE_REPO is empty in config.sh — skipping gh release" >&2
         exit 0
     fi
-    TAG="libE57Format-v${LIBE57_VERSION}"
+    TAG="${RELEASE_TAG:-libE57Format-v${LIBE57_VERSION}}"
+    TITLE="${RELEASE_TITLE:-libE57Format v${LIBE57_VERSION} Framework}"
+    NOTES="${RELEASE_NOTES:-Self-contained binary framework for libE57Format v${LIBE57_VERSION} (xerces-c ${XERCES_VERSION} bundled)}"
     step "Publishing gh release ${TAG} to ${GH_RELEASE_REPO}"
-    gh release create "${TAG}" "${OUTPUT_DIR}/${ZIP}" \
+    release_assets=("${OUTPUT_DIR}/${ZIP}")
+    [ -n "${ZIP_IOS}" ] && [ -f "${OUTPUT_DIR}/${ZIP_IOS}" ] \
+        && release_assets+=("${OUTPUT_DIR}/${ZIP_IOS}")
+    gh release create "${TAG}" "${release_assets[@]}" \
         --repo "${GH_RELEASE_REPO}" \
-        --title "libE57Format v${LIBE57_VERSION} Framework" \
-        --notes "Self-contained binary framework for libE57Format v${LIBE57_VERSION} (xerces-c ${XERCES_VERSION} bundled)"
+        --title "${TITLE}" \
+        --notes "${NOTES}"
 fi

@@ -735,10 +735,15 @@ if [ "${RELEASE:-0}" = "1" ]; then
         echo "RELEASE=1 set but GH_RELEASE_REPO is empty in config.sh — skipping gh release" >&2
         exit 0
     fi
-    TAG="pdal-v${PDAL_VERSION}"
+    TAG="${RELEASE_TAG:-pdal-v${PDAL_VERSION}}"
+    TITLE="${RELEASE_TITLE:-PDAL v${PDAL_VERSION} Framework}"
+    NOTES="${RELEASE_NOTES:-Binary framework for PDAL v${PDAL_VERSION}}"
     step "Publishing gh release ${TAG} to ${GH_RELEASE_REPO}"
-    gh release create "${TAG}" "${OUTPUT_DIR}/${ZIP}" \
+    release_assets=("${OUTPUT_DIR}/${ZIP}")
+    [ -n "${ZIP_IOS}" ] && [ -f "${OUTPUT_DIR}/${ZIP_IOS}" ] \
+        && release_assets+=("${OUTPUT_DIR}/${ZIP_IOS}")
+    gh release create "${TAG}" "${release_assets[@]}" \
         --repo "${GH_RELEASE_REPO}" \
-        --title "PDAL v${PDAL_VERSION} Framework" \
-        --notes "Binary framework for PDAL v${PDAL_VERSION}"
+        --title "${TITLE}" \
+        --notes "${NOTES}"
 fi
